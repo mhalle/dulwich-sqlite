@@ -2,7 +2,7 @@
 
 import sqlite3
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -23,7 +23,8 @@ CREATE_TABLES = [
                 WHEN 3 THEN 'blob'
                 WHEN 4 THEN 'tag'
             END
-        ) VIRTUAL
+        ) VIRTUAL,
+        size_bytes INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
     )
     """,
     """
@@ -58,6 +59,21 @@ CREATE_TABLES = [
         value TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS reflog (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ref_name BLOB NOT NULL,
+        old_sha BLOB NOT NULL,
+        new_sha BLOB NOT NULL,
+        committer BLOB NOT NULL,
+        timestamp INTEGER NOT NULL,
+        timezone INTEGER NOT NULL,
+        message BLOB NOT NULL,
+        ref_name_text TEXT GENERATED ALWAYS AS (cast(ref_name AS TEXT)) VIRTUAL,
+        message_text TEXT GENERATED ALWAYS AS (cast(message AS TEXT)) VIRTUAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_reflog_ref ON reflog (ref_name, id)",
 ]
 
 

@@ -54,6 +54,16 @@ class SqliteObjectStore(PackCapableObjectStore):
     def packs(self) -> list[Pack]:
         return []
 
+    def get_object_size(self, sha: ObjectID | RawObjectID) -> int:
+        hexsha = self._to_hexsha(sha)
+        row = self._conn.execute(
+            "SELECT length(data) FROM objects WHERE sha = ?",
+            (hexsha.decode("ascii"),),
+        ).fetchone()
+        if row is None:
+            raise KeyError(hexsha)
+        return row[0]
+
     def get_raw(self, name: RawObjectID | ObjectID) -> tuple[int, bytes]:
         hexsha = self._to_hexsha(name)
         row = self._conn.execute(

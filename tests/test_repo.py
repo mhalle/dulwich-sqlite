@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 from dulwich.errors import NotGitRepository
+from dulwich.objects import ZERO_SHA, Blob
 
 from dulwich_sqlite import SqliteRepo
 
@@ -84,3 +85,36 @@ class TestSqliteRepo:
         db_path = str(tmp_path / "does_not_exist.db")
         with pytest.raises(NotGitRepository):
             SqliteRepo(db_path)
+
+    def test_read_reflog(self, sqlite_repo):
+        blob = Blob.from_string(b"data")
+        sqlite_repo.object_store.add_object(blob)
+        sqlite_repo.refs.set_if_equals(
+            b"refs/heads/main", None, blob.id, message=b"branch: Created"
+        )
+        entries = list(sqlite_repo.read_reflog(b"refs/heads/main"))
+        assert len(entries) == 1
+        assert entries[0].old_sha == ZERO_SHA
+        assert entries[0].new_sha == blob.id
+        assert entries[0].message == b"branch: Created"
+        assert entries[0].committer == b"dulwich-sqlite <dulwich-sqlite@localhost>"
+
+    def test_read_reflog_multiple_entries(self, sqlite_repo):
+        blob1 = Blob.from_string(b"one")
+        blob2 = Blob.from_string(b"two")
+        sqlite_repo.object_store.add_objects([(blob1, None), (blob2, None)])
+        sqlite_repo.refs.set_if_equals(
+            b"refs/heads/main", None, blob1.id, message=b"init"
+        )
+        sqlite_repo.refs.set_if_equals(
+            b"refs/heads/main", blob1.id, blob2.id, message=b"update"
+        )
+        entries = list(sqlite_repo.read_reflog(b"refs/heads/main"))
+        assert len(entries) == 2
+        assert entries[0].new_sha == blob1.id
+        assert entries[1].old_sha == blob1.id
+        assert entries[1].new_sha == blob2.id
+
+    def test_read_reflog_empty(self, sqlite_repo):
+        entries = list(sqlite_repo.read_reflog(b"refs/heads/nonexistent"))
+        assert entries == []

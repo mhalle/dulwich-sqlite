@@ -4,6 +4,7 @@ import sqlite3
 import threading
 
 import pytest
+from dulwich.objects import ZERO_SHA
 from dulwich.refs import SYMREF
 
 from dulwich_sqlite._schema import init_db
@@ -16,6 +17,21 @@ def refs_container():
     init_db(conn)
     container = SqliteRefsContainer(conn)
     yield container
+    conn.close()
+
+
+@pytest.fixture
+def logged_refs():
+    """RefsContainer with a logger that records calls."""
+    conn = sqlite3.connect(":memory:")
+    init_db(conn)
+    log = []
+
+    def logger(ref, old_sha, new_sha, committer, timestamp, timezone, message):
+        log.append((ref, old_sha, new_sha, committer, timestamp, timezone, message))
+
+    container = SqliteRefsContainer(conn, logger=logger)
+    yield container, log
     conn.close()
 
 
@@ -97,6 +113,81 @@ class TestSqliteRefsContainer:
 
     def test_read_loose_ref_missing(self, refs_container):
         assert refs_container.read_loose_ref(b"refs/heads/nonexistent") is None
+
+
+class TestReflog:
+    """Verify that reflog entries are written on ref mutations."""
+
+    def test_set_if_equals_logs(self, logged_refs):
+        container, log = logged_refs
+        sha = b"a" * 40
+        container.set_if_equals(
+            b"refs/heads/main", None, sha, message=b"branch: Created"
+        )
+        assert len(log) == 1
+        ref, old, new, _, _, _, msg = log[0]
+        assert ref == b"refs/heads/main"
+        assert old == ZERO_SHA
+        assert new == sha
+        assert msg == b"branch: Created"
+
+    def test_set_if_equals_cas_logs(self, logged_refs):
+        container, log = logged_refs
+        old_sha = b"a" * 40
+        new_sha = b"b" * 40
+        container.set_if_equals(b"refs/heads/main", None, old_sha, message=b"init")
+        container.set_if_equals(
+            b"refs/heads/main", old_sha, new_sha, message=b"update"
+        )
+        assert len(log) == 2
+        assert log[1][1] == old_sha
+        assert log[1][2] == new_sha
+        assert log[1][6] == b"update"
+
+    def test_add_if_new_logs(self, logged_refs):
+        container, log = logged_refs
+        sha = b"a" * 40
+        container.add_if_new(b"refs/heads/feature", sha, message=b"branch: Created")
+        assert len(log) == 1
+        assert log[0][0] == b"refs/heads/feature"
+        assert log[0][1] == ZERO_SHA
+        assert log[0][2] == sha
+
+    def test_add_if_new_duplicate_no_log(self, logged_refs):
+        container, log = logged_refs
+        sha1 = b"a" * 40
+        sha2 = b"b" * 40
+        container.add_if_new(b"refs/heads/feature", sha1, message=b"first")
+        container.add_if_new(b"refs/heads/feature", sha2, message=b"second")
+        # Only the first (successful) call should log
+        assert len(log) == 1
+
+    def test_remove_if_equals_logs(self, logged_refs):
+        container, log = logged_refs
+        sha = b"a" * 40
+        container.set_if_equals(b"refs/heads/main", None, sha, message=b"init")
+        log.clear()
+        container.remove_if_equals(b"refs/heads/main", sha, message=b"branch: Deleted")
+        assert len(log) == 1
+        assert log[0][1] == sha
+        assert log[0][2] == ZERO_SHA
+
+    def test_set_symbolic_ref_logs(self, logged_refs):
+        container, log = logged_refs
+        sha = b"a" * 40
+        container.set_if_equals(b"refs/heads/main", None, sha, message=b"init")
+        log.clear()
+        container.set_symbolic_ref(b"HEAD", b"refs/heads/main", message=b"checkout")
+        assert len(log) == 1
+        assert log[0][0] == b"HEAD"
+        assert log[0][6] == b"checkout"
+
+    def test_no_log_without_message(self, logged_refs):
+        """RefsContainer._log skips logging when message is None."""
+        container, log = logged_refs
+        sha = b"a" * 40
+        container.set_if_equals(b"refs/heads/main", None, sha)
+        assert len(log) == 0
 
 
 class TestConcurrentCAS:

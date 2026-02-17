@@ -2,8 +2,11 @@
 
 import sqlite3
 import sys
+import time
+from collections.abc import Generator
 from io import BytesIO
 
+from dulwich import reflog
 from dulwich.errors import NoIndexPresent, NotGitRepository
 from dulwich.repo import BaseRepo
 
@@ -24,7 +27,7 @@ class SqliteRepo(BaseRepo):
         apply_pragmas(self._conn)
         self._verify_schema()
         object_store = SqliteObjectStore(self._conn)
-        refs_container = SqliteRefsContainer(self._conn)
+        refs_container = SqliteRefsContainer(self._conn, logger=self._write_reflog)
         super().__init__(object_store, refs_container)
         self.bare = True
         self._load_config()
@@ -44,6 +47,41 @@ class SqliteRepo(BaseRepo):
             self._conn.close()
             raise NotGitRepository(
                 f"Not a dulwich-sqlite repository: {self._db_path}"
+            )
+
+    def _write_reflog(
+        self,
+        ref: bytes,
+        old_sha: bytes,
+        new_sha: bytes,
+        committer: bytes | None,
+        timestamp: int | None,
+        timezone: int | None,
+        message: bytes,
+    ) -> None:
+        if committer is None:
+            committer = b"dulwich-sqlite <dulwich-sqlite@localhost>"
+        if timestamp is None:
+            timestamp = int(time.time())
+        if timezone is None:
+            timezone = 0
+        self._conn.execute(
+            "INSERT INTO reflog (ref_name, old_sha, new_sha, committer, timestamp, timezone, message) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ref, old_sha, new_sha, committer, timestamp, timezone, message),
+        )
+        self._conn.commit()
+
+    def read_reflog(self, ref: bytes) -> Generator[reflog.Entry, None, None]:
+        rows = self._conn.execute(
+            "SELECT old_sha, new_sha, committer, timestamp, timezone, message "
+            "FROM reflog WHERE ref_name = ? ORDER BY id ASC",
+            (ref,),
+        ).fetchall()
+        for row in rows:
+            yield reflog.Entry(
+                bytes(row[0]), bytes(row[1]), bytes(row[2]),
+                row[3], row[4], bytes(row[5]),
             )
 
     def _load_config(self) -> None:
