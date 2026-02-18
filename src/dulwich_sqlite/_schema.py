@@ -2,7 +2,7 @@
 
 import sqlite3
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -15,7 +15,8 @@ CREATE_TABLES = [
     CREATE TABLE IF NOT EXISTS objects (
         sha TEXT PRIMARY KEY NOT NULL,
         type_num INTEGER NOT NULL,
-        data BLOB NOT NULL,
+        data BLOB,
+        total_size INTEGER,
         type_name TEXT GENERATED ALWAYS AS (
             CASE type_num
                 WHEN 1 THEN 'commit'
@@ -24,9 +25,26 @@ CREATE_TABLES = [
                 WHEN 4 THEN 'tag'
             END
         ) VIRTUAL,
-        size_bytes INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
+        size_bytes INTEGER GENERATED ALWAYS AS (
+            CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END
+        ) VIRTUAL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS chunks (
+        chunk_sha TEXT PRIMARY KEY NOT NULL,
+        data BLOB NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS object_chunks (
+        object_sha TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        chunk_sha TEXT NOT NULL,
+        PRIMARY KEY (object_sha, chunk_index)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_object_chunks_chunk ON object_chunks (chunk_sha)",
     """
     CREATE TABLE IF NOT EXISTS refs (
         name BLOB PRIMARY KEY NOT NULL,
@@ -94,3 +112,66 @@ def apply_pragmas(conn: sqlite3.Connection) -> None:
     """Apply PRAGMAs to an existing connection."""
     for pragma in PRAGMAS:
         conn.execute(pragma)
+
+
+def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Migrate a v3 database to v4 schema.
+
+    Recreates the objects table (SQLite can't ALTER COLUMN to drop NOT NULL),
+    and creates the new chunks/object_chunks tables.
+    """
+    conn.execute("ALTER TABLE objects RENAME TO _objects_v3")
+    conn.execute(
+        """
+        CREATE TABLE objects (
+            sha TEXT PRIMARY KEY NOT NULL,
+            type_num INTEGER NOT NULL,
+            data BLOB,
+            total_size INTEGER,
+            type_name TEXT GENERATED ALWAYS AS (
+                CASE type_num
+                    WHEN 1 THEN 'commit'
+                    WHEN 2 THEN 'tree'
+                    WHEN 3 THEN 'blob'
+                    WHEN 4 THEN 'tag'
+                END
+            ) VIRTUAL,
+            size_bytes INTEGER GENERATED ALWAYS AS (
+                CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END
+            ) VIRTUAL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO objects (sha, type_num, data) "
+        "SELECT sha, type_num, data FROM _objects_v3"
+    )
+    conn.execute("DROP TABLE _objects_v3")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chunks (
+            chunk_sha TEXT PRIMARY KEY NOT NULL,
+            data BLOB NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS object_chunks (
+            object_sha TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_sha TEXT NOT NULL,
+            PRIMARY KEY (object_sha, chunk_index)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_object_chunks_chunk ON object_chunks (chunk_sha)"
+    )
+
+    conn.execute(
+        "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+        (SCHEMA_VERSION,),
+    )
+    conn.commit()

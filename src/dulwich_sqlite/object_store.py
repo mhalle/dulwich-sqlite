@@ -15,7 +15,10 @@ from dulwich.pack import (
     write_pack_data,
 )
 
+from ._chunking import chunk_blob
+
 PACK_SPOOL_FILE_MAX_SIZE = 200 * 1024 * 1024
+_BLOB_TYPE_NUM = 3
 
 
 class SqliteObjectStore(PackCapableObjectStore):
@@ -57,7 +60,7 @@ class SqliteObjectStore(PackCapableObjectStore):
     def get_object_size(self, sha: ObjectID | RawObjectID) -> int:
         hexsha = self._to_hexsha(sha)
         row = self._conn.execute(
-            "SELECT length(data) FROM objects WHERE sha = ?",
+            "SELECT size_bytes FROM objects WHERE sha = ?",
             (hexsha.decode("ascii"),),
         ).fetchone()
         if row is None:
@@ -72,14 +75,55 @@ class SqliteObjectStore(PackCapableObjectStore):
         ).fetchone()
         if row is None:
             raise KeyError(hexsha)
-        return row[0], bytes(row[1])
+        type_num, data = row
+        if data is not None:
+            return type_num, bytes(data)
+        # Reassemble from chunks
+        sha_str = hexsha.decode("ascii")
+        chunk_rows = self._conn.execute(
+            "SELECT c.data FROM object_chunks oc "
+            "JOIN chunks c ON oc.chunk_sha = c.chunk_sha "
+            "WHERE oc.object_sha = ? ORDER BY oc.chunk_index",
+            (sha_str,),
+        ).fetchall()
+        return type_num, b"".join(bytes(r[0]) for r in chunk_rows)
 
     def _insert_object(self, obj: ShaFile) -> None:
         """Insert a single object without committing the transaction."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO objects (sha, type_num, data) VALUES (?, ?, ?)",
-            (obj.id.decode("ascii"), obj.type_num, obj.as_raw_string()),
-        )
+        sha_str = obj.id.decode("ascii")
+        raw_data = obj.as_raw_string()
+
+        chunks = None
+        if obj.type_num == _BLOB_TYPE_NUM:
+            chunks = chunk_blob(raw_data)
+
+        if chunks is not None:
+            # Chunked storage: clear any existing chunks for REPLACE semantics
+            self._conn.execute(
+                "DELETE FROM object_chunks WHERE object_sha = ?",
+                (sha_str,),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO objects (sha, type_num, data, total_size) "
+                "VALUES (?, ?, NULL, ?)",
+                (sha_str, obj.type_num, len(raw_data)),
+            )
+            for idx, (chunk_sha, chunk_data) in enumerate(chunks):
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO chunks (chunk_sha, data) VALUES (?, ?)",
+                    (chunk_sha, chunk_data),
+                )
+                self._conn.execute(
+                    "INSERT INTO object_chunks (object_sha, chunk_index, chunk_sha) "
+                    "VALUES (?, ?, ?)",
+                    (sha_str, idx, chunk_sha),
+                )
+        else:
+            # Inline storage
+            self._conn.execute(
+                "INSERT OR REPLACE INTO objects (sha, type_num, data) VALUES (?, ?, ?)",
+                (sha_str, obj.type_num, raw_data),
+            )
 
     def add_object(self, obj: ShaFile) -> None:
         self._insert_object(obj)

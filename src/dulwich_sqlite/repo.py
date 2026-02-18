@@ -10,7 +10,7 @@ from dulwich import reflog
 from dulwich.errors import NoIndexPresent, NotGitRepository
 from dulwich.repo import BaseRepo
 
-from ._schema import apply_pragmas, init_db
+from ._schema import SCHEMA_VERSION, apply_pragmas, init_db, migrate_v3_to_v4
 from .object_store import SqliteObjectStore
 from .refs import SqliteRefsContainer
 
@@ -33,7 +33,10 @@ class SqliteRepo(BaseRepo):
         self._load_config()
 
     def _verify_schema(self) -> None:
-        """Check that the database has been initialized with our schema."""
+        """Check that the database has been initialized with our schema.
+
+        Automatically migrates v3 databases to v4.
+        """
         try:
             row = self._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
@@ -48,6 +51,9 @@ class SqliteRepo(BaseRepo):
             raise NotGitRepository(
                 f"Not a dulwich-sqlite repository: {self._db_path}"
             )
+        version = row[0]
+        if version == "3":
+            migrate_v3_to_v4(self._conn)
 
     def _write_reflog(
         self,
