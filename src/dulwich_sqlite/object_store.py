@@ -1,5 +1,6 @@
 """SQLite-backed object store for Dulwich."""
 
+import re
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from typing import BinaryIO, cast
@@ -16,9 +17,28 @@ from dulwich.pack import (
 )
 
 from ._chunking import chunk_blob
+from ._schema import has_fts
 
 PACK_SPOOL_FILE_MAX_SIZE = 200 * 1024 * 1024
 _BLOB_TYPE_NUM = 3
+
+_QUOTE_FTS_RE = re.compile(r'\s+|(".*?")')
+
+
+def _quote_fts(query: str) -> str:
+    """Escape a query for safe FTS5 MATCH usage.
+
+    Wraps each token in double quotes so operator words (AND/OR/NOT)
+    are treated as literals. Already-quoted phrases are preserved.
+    Mimics sqlite-utils' ``quote_fts`` behaviour.
+    """
+    if query.count('"') % 2:
+        query += '"'
+    bits = _QUOTE_FTS_RE.split(query)
+    bits = [b for b in bits if b and b != '""']
+    return " ".join(
+        '"{}"'.format(bit) if not bit.startswith('"') else bit for bit in bits
+    )
 
 
 class SqliteObjectStore(PackCapableObjectStore):
@@ -204,3 +224,72 @@ class SqliteObjectStore(PackCapableObjectStore):
             raise
         else:
             commit()
+
+    def search_content(
+        self,
+        query: str,
+        *,
+        ranked: bool = False,
+        limit: int | None = None,
+        quote: bool = False,
+    ) -> list[ObjectID]:
+        """Search blob content for matching objects.
+
+        Args:
+            query: Search term. With FTS enabled, supports full FTS5 syntax:
+                AND/OR/NOT operators, "phrase queries", prefix*, NEAR(a b).
+                Without FTS, treated as a substring match.
+            ranked: Order results by BM25 relevance (FTS only, ignored otherwise).
+            limit: Maximum number of results to return.
+            quote: Apply FTS quoting rules to the query, disabling advanced
+                syntax so user-provided strings can be searched safely.
+                Mimics sqlite-utils ``quote_fts``. FTS only, ignored otherwise.
+        """
+        params: list[str]
+        if has_fts(self._conn):
+            match_query = _quote_fts(query) if quote else query
+            if ranked:
+                sql = """
+                    SELECT object_sha FROM (
+                        SELECT oc.object_sha, chunks_fts.rank AS rnk
+                        FROM chunks_fts
+                        JOIN chunks c ON c.rowid = chunks_fts.rowid
+                        JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha
+                        WHERE chunks_fts MATCH ?
+                        UNION ALL
+                        SELECT sha, 0 FROM objects
+                        WHERE data IS NOT NULL AND type_num = 3
+                          AND CAST(data AS TEXT) LIKE ?
+                    )
+                    GROUP BY object_sha
+                    ORDER BY MIN(rnk)
+                """
+            else:
+                sql = """
+                    SELECT DISTINCT oc.object_sha FROM chunks_fts
+                    JOIN chunks c ON c.rowid = chunks_fts.rowid
+                    JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha
+                    WHERE chunks_fts MATCH ?
+                    UNION
+                    SELECT sha FROM objects
+                    WHERE data IS NOT NULL AND type_num = 3
+                      AND CAST(data AS TEXT) LIKE ?
+                """
+            if limit is not None:
+                sql += f" LIMIT {int(limit)}"
+            params = [match_query, f"%{query}%"]
+        else:
+            sql = """
+                SELECT DISTINCT oc.object_sha FROM chunks c
+                JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha
+                WHERE CAST(c.data AS TEXT) LIKE ?
+                UNION
+                SELECT sha FROM objects
+                WHERE data IS NOT NULL AND type_num = 3
+                  AND CAST(data AS TEXT) LIKE ?
+            """
+            if limit is not None:
+                sql += f" LIMIT {int(limit)}"
+            params = [f"%{query}%", f"%{query}%"]
+        rows = self._conn.execute(sql, params).fetchall()
+        return [r[0].encode("ascii") for r in rows]
