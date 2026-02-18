@@ -6,7 +6,7 @@ import pytest
 from dulwich.objects import Blob, Tree
 
 from dulwich_sqlite import SqliteRepo
-from dulwich_sqlite._schema import enable_fts, has_fts, init_db
+from dulwich_sqlite._schema import init_db
 from dulwich_sqlite.object_store import SqliteObjectStore
 
 
@@ -251,9 +251,9 @@ def _large_text(keyword: str, n: int = 500) -> bytes:
     return b"".join(f"{keyword} line {i} of the file\n".encode() for i in range(n))
 
 
-class TestFTSSearch:
-    def test_search_content_without_fts(self, store):
-        """LIKE fallback finds inline + chunked objects."""
+class TestSearchContent:
+    def test_search_finds_inline_and_chunked(self, store):
+        """LIKE search finds both inline and chunked objects."""
         small_blob = Blob.from_string(b"hello world inline")
         store.add_object(small_blob)
         large_blob = Blob.from_string(_large_text("hello"))
@@ -262,58 +262,6 @@ class TestFTSSearch:
         results = store.search_content("hello")
         assert small_blob.id in results
         assert large_blob.id in results
-
-    def test_search_content_with_fts(self, store):
-        """FTS path returns correct results."""
-        small_blob = Blob.from_string(b"hello world inline")
-        store.add_object(small_blob)
-        large_blob = Blob.from_string(_large_text("hello"))
-        store.add_object(large_blob)
-
-        enable_fts(store._conn)
-
-        results = store.search_content("hello")
-        assert small_blob.id in results
-        assert large_blob.id in results
-
-    def test_search_fts5_syntax(self, store):
-        """AND/OR/NOT/phrase/prefix queries work with FTS."""
-        blob1 = Blob.from_string(_large_text("alpha beta"))
-        blob2 = Blob.from_string(_large_text("alpha gamma"))
-        store.add_object(blob1)
-        store.add_object(blob2)
-
-        enable_fts(store._conn)
-
-        # AND
-        results = store.search_content("alpha AND beta")
-        assert blob1.id in results
-        assert blob2.id not in results
-
-        # OR
-        results = store.search_content("beta OR gamma")
-        assert blob1.id in results
-        assert blob2.id in results
-
-        # NOT
-        results = store.search_content("alpha NOT beta")
-        assert blob2.id in results
-        assert blob1.id not in results
-
-        # Prefix
-        results = store.search_content("alph*")
-        assert blob1.id in results
-        assert blob2.id in results
-
-    def test_search_ranked(self, store):
-        """ranked=True returns results ordered by relevance."""
-        blob = Blob.from_string(_large_text("hello"))
-        store.add_object(blob)
-
-        enable_fts(store._conn)
-
-        results = store.search_content("hello", ranked=True)
-        assert blob.id in results
 
     def test_search_limit(self, store):
         """limit caps results."""
@@ -323,84 +271,13 @@ class TestFTSSearch:
             store.add_object(b)
             blobs.append(b)
 
-        enable_fts(store._conn)
-
         results = store.search_content("common", limit=3)
         assert len(results) <= 3
 
-    def test_enable_fts_backfills_existing(self, store):
-        """Enabling FTS on DB with data indexes existing chunks."""
-        blob = Blob.from_string(_large_text("backfillword"))
+    def test_search_no_match(self, store):
+        """Returns empty list when nothing matches."""
+        blob = Blob.from_string(b"hello world")
         store.add_object(blob)
 
-        assert not has_fts(store._conn)
-        enable_fts(store._conn)
-        assert has_fts(store._conn)
-
-        results = store.search_content("backfillword")
-        assert blob.id in results
-
-    def test_disable_fts_falls_back(self, store):
-        """After disable, search still works via LIKE."""
-        from dulwich_sqlite._schema import disable_fts
-
-        blob = Blob.from_string(_large_text("persistword"))
-        store.add_object(blob)
-
-        enable_fts(store._conn)
-        results = store.search_content("persistword")
-        assert blob.id in results
-
-        disable_fts(store._conn)
-        assert not has_fts(store._conn)
-
-        results = store.search_content("persistword")
-        assert blob.id in results
-
-    def test_init_bare_with_fts(self, tmp_path):
-        """FTS ready from creation."""
-        db = str(tmp_path / "fts.db")
-        repo = SqliteRepo.init_bare(db, fts=True)
-        try:
-            assert has_fts(repo._conn)
-            blob = Blob.from_string(_large_text("initword"))
-            repo.object_store.add_object(blob)
-            results = repo.object_store.search_content("initword")
-            assert blob.id in results
-        finally:
-            repo.close()
-
-    def test_fts_excludes_binary(self, store):
-        """Binary chunks containing null bytes are not indexed in FTS."""
-        # Create binary data with null bytes every 64 bytes, ensuring every
-        # chunk (min 2048 bytes) will contain null bytes.
-        binary_data = (b"A" * 63 + b"\x00") * 800  # 51200 bytes
-        blob = Blob.from_string(binary_data)
-        store.add_object(blob)
-
-        enable_fts(store._conn)
-
-        count = store._conn.execute(
-            "SELECT COUNT(*) FROM chunks_fts"
-        ).fetchone()[0]
-        assert count == 0
-
-    def test_search_quote_disables_operators(self, store):
-        """quote=True treats AND/OR/NOT as literal words."""
-        blob1 = Blob.from_string(_large_text("alpha NOT"))
-        blob2 = Blob.from_string(_large_text("alpha beta"))
-        store.add_object(blob1)
-        store.add_object(blob2)
-
-        enable_fts(store._conn)
-
-        # Without quote: "alpha NOT beta" is FTS syntax → exclude blob2's "beta"
-        results = store.search_content("alpha NOT beta")
-        assert blob1.id in results
-        assert blob2.id not in results
-
-        # With quote: "alpha NOT beta" becomes '"alpha" "NOT" "beta"' →
-        # match chunks containing all three literal words
-        results = store.search_content("alpha NOT beta", quote=True)
-        # Neither blob has all three words "alpha", "NOT", and "beta" in a chunk
-        assert blob2.id not in results
+        results = store.search_content("nonexistent")
+        assert results == []

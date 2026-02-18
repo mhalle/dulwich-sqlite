@@ -114,57 +114,6 @@ def apply_pragmas(conn: sqlite3.Connection) -> None:
         conn.execute(pragma)
 
 
-def has_fts(conn: sqlite3.Connection) -> bool:
-    """Check if FTS5 search is enabled on the chunks table."""
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
-    ).fetchone()
-    return row is not None
-
-
-def enable_fts(conn: sqlite3.Connection) -> None:
-    """Enable FTS5 full-text search on chunk content.
-
-    Creates an external-content FTS5 index on the chunks table with triggers
-    to keep it in sync.  Binary chunks (containing null bytes) are excluded.
-    Inherits deduplication from the chunks table — shared chunks are indexed
-    once regardless of how many blob versions reference them.
-    """
-    if has_fts(conn):
-        return
-    conn.execute(
-        "CREATE VIRTUAL TABLE chunks_fts USING fts5("
-        "data, content='chunks', content_rowid='rowid')"
-    )
-    conn.execute(
-        "CREATE TRIGGER chunks_fts_ai AFTER INSERT ON chunks BEGIN"
-        "    INSERT INTO chunks_fts(rowid, data)"
-        "    SELECT NEW.rowid, CAST(NEW.data AS TEXT)"
-        "    WHERE instr(NEW.data, X'00') = 0;"
-        " END"
-    )
-    conn.execute(
-        "CREATE TRIGGER chunks_fts_ad BEFORE DELETE ON chunks BEGIN"
-        "    INSERT INTO chunks_fts(chunks_fts, rowid, data)"
-        "    VALUES('delete', OLD.rowid, CAST(OLD.data AS TEXT));"
-        " END"
-    )
-    # Backfill existing text chunks
-    conn.execute(
-        "INSERT INTO chunks_fts(rowid, data)"
-        " SELECT rowid, CAST(data AS TEXT) FROM chunks"
-        " WHERE instr(data, X'00') = 0"
-    )
-    conn.commit()
-
-
-def disable_fts(conn: sqlite3.Connection) -> None:
-    """Disable FTS5 full-text search."""
-    conn.execute("DROP TRIGGER IF EXISTS chunks_fts_ai")
-    conn.execute("DROP TRIGGER IF EXISTS chunks_fts_ad")
-    conn.execute("DROP TABLE IF EXISTS chunks_fts")
-    conn.commit()
-
 
 def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     """Migrate a v3 database to v4 schema.

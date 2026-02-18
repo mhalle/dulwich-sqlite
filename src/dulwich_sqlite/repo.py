@@ -13,8 +13,6 @@ from dulwich.repo import BaseRepo
 from ._schema import (
     SCHEMA_VERSION,
     apply_pragmas,
-    disable_fts as _disable_fts,
-    enable_fts as _enable_fts,
     init_db,
     migrate_v3_to_v4,
 )
@@ -107,23 +105,13 @@ class SqliteRepo(BaseRepo):
             self._config = ConfigFile()
 
     @classmethod
-    def init_bare(cls, db_path: str, fts: bool = False) -> "SqliteRepo":
+    def init_bare(cls, db_path: str) -> "SqliteRepo":
         conn = sqlite3.connect(db_path)
         init_db(conn)
-        if fts:
-            _enable_fts(conn)
         conn.close()
         repo = cls(db_path)
         repo._init_files(bare=True)
         return repo
-
-    def enable_fts(self) -> None:
-        """Enable FTS5 full-text search on blob content."""
-        _enable_fts(self._conn)
-
-    def disable_fts(self) -> None:
-        """Disable FTS5 full-text search."""
-        _disable_fts(self._conn)
 
     def get_named_file(
         self,
