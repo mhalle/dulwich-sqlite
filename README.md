@@ -136,6 +136,26 @@ results = repo.object_store.search_content(user_input, quote=True)
 
 When FTS is enabled, the index lives on the deduplicated chunks table — shared chunks across blob versions are indexed once. A one-line edit to a large file only adds the changed chunk to the index, not the whole file.
 
+FTS5 operators (AND/OR/NOT, phrases, NEAR) match within a single chunk (~4 KB). To search across an entire blob — e.g. find files containing both "import flask" and "def create_app" even if they're far apart — intersect per-term searches:
+
+```python
+store = repo.object_store
+
+# Document-level AND: both terms anywhere in the same blob
+flask_hits = set(store.search_content("flask"))
+create_app_hits = set(store.search_content("create_app"))
+both = flask_hits & create_app_hits
+
+# Document-level OR
+either = flask_hits | create_app_hits
+
+# Document-level NOT: has "flask" but not "django"
+django_hits = set(store.search_content("django"))
+flask_only = flask_hits - django_hits
+```
+
+Each `search_content` call uses FTS5 MATCH for fast chunk lookup, then the set operations combine results at the blob level.
+
 ### `SqliteRefsContainer`
 
 Extends `RefsContainer`. Supports:
