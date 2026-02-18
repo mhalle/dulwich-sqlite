@@ -1,6 +1,5 @@
 """Integration tests for chunk-based deduplication."""
 
-import random
 import sqlite3
 
 import pytest
@@ -381,7 +380,6 @@ class TestFTSSearch:
 
         enable_fts(store._conn)
 
-        # Verify no binary chunks were indexed
         count = store._conn.execute(
             "SELECT COUNT(*) FROM chunks_fts"
         ).fetchone()[0]
@@ -389,7 +387,6 @@ class TestFTSSearch:
 
     def test_search_quote_disables_operators(self, store):
         """quote=True treats AND/OR/NOT as literal words."""
-        # Both blobs contain "alpha", only blob1 also contains "NOT"
         blob1 = Blob.from_string(_large_text("alpha NOT"))
         blob2 = Blob.from_string(_large_text("alpha beta"))
         store.add_object(blob1)
@@ -405,5 +402,5 @@ class TestFTSSearch:
         # With quote: "alpha NOT beta" becomes '"alpha" "NOT" "beta"' →
         # match chunks containing all three literal words
         results = store.search_content("alpha NOT beta", quote=True)
-        # Neither blob has all three words "alpha", "NOT", and "beta" in one chunk
+        # Neither blob has all three words "alpha", "NOT", and "beta" in a chunk
         assert blob2.id not in results

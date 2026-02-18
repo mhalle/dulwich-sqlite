@@ -126,8 +126,9 @@ def enable_fts(conn: sqlite3.Connection) -> None:
     """Enable FTS5 full-text search on chunk content.
 
     Creates an external-content FTS5 index on the chunks table with triggers
-    to keep it in sync. Binary chunks (containing null bytes) are excluded.
-    Backfills existing text chunks into the index.
+    to keep it in sync.  Binary chunks (containing null bytes) are excluded.
+    Inherits deduplication from the chunks table — shared chunks are indexed
+    once regardless of how many blob versions reference them.
     """
     if has_fts(conn):
         return
