@@ -8,6 +8,8 @@ A SQLite storage backend for [Dulwich](https://www.dulwich.io/), the pure-Python
 - **No filesystem layout** — no `.git/objects/`, no loose files, no packfiles on disk
 - **Embeddable** — use Git data structures inside any application that already uses SQLite
 - **Transactional** — writes go through SQLite's WAL journal, giving you atomic commits for free
+- **Deduplicated** — large blobs are content-chunked so shared regions across versions are stored once
+- **Searchable** — opt-in FTS5 full-text search over blob content with dedup-efficient indexing
 
 ## Installation
 
@@ -15,7 +17,7 @@ A SQLite storage backend for [Dulwich](https://www.dulwich.io/), the pure-Python
 pip install dulwich-sqlite
 ```
 
-Requires Python 3.12+ and `dulwich >= 1.0.0`. No other dependencies — SQLite is in the standard library.
+Requires Python 3.12+ and `dulwich >= 1.0.0`, `fastcdc`. SQLite is in the standard library.
 
 ## Quick start
 
@@ -92,10 +94,12 @@ target.close()
 
 | Method | Description |
 |---|---|
-| `SqliteRepo.init_bare(db_path)` | Create a new bare repository in a SQLite file |
+| `SqliteRepo.init_bare(db_path, fts=False)` | Create a new bare repository in a SQLite file |
 | `SqliteRepo(db_path)` | Open an existing repository |
 | `repo.object_store` | `SqliteObjectStore` instance for reading/writing git objects |
 | `repo.refs` | `SqliteRefsContainer` instance for branches, tags, HEAD |
+| `repo.enable_fts()` | Enable FTS5 full-text search (backfills existing data) |
+| `repo.disable_fts()` | Disable FTS5 and drop the index |
 | `repo.get_config()` | Returns the repository `ConfigFile` |
 | `repo.get_description()` | Returns the repository description as bytes |
 | `repo.set_description(desc)` | Sets the repository description |
@@ -113,6 +117,25 @@ Extends `PackCapableObjectStore`. Supports the full Dulwich object store interfa
 
 Pack data is never stored as-is. Incoming packs are unpacked into individual objects via `PackInflater`, matching how `MemoryObjectStore` works.
 
+#### Content search
+
+```python
+# Enable FTS at creation or on an existing repo
+repo = SqliteRepo.init_bare("repo.db", fts=True)
+# repo.enable_fts()  # on an existing repo
+
+# Search blob content (full FTS5 syntax when FTS is enabled)
+results = repo.object_store.search_content("def main")
+results = repo.object_store.search_content("error OR exception", ranked=True, limit=10)
+
+# Safe quoting for user-provided input (disables FTS operators)
+results = repo.object_store.search_content(user_input, quote=True)
+
+# Falls back to LIKE substring matching when FTS is not enabled
+```
+
+When FTS is enabled, the index lives on the deduplicated chunks table — shared chunks across blob versions are indexed once. A one-line edit to a large file only adds the changed chunk to the index, not the whole file.
+
 ### `SqliteRefsContainer`
 
 Extends `RefsContainer`. Supports:
@@ -126,15 +149,19 @@ Extends `RefsContainer`. Supports:
 
 ## Schema
 
-All data lives in five tables within the SQLite file:
-
 | Table | Purpose |
 |---|---|
-| `objects` | Git objects (blobs, trees, commits, tags) keyed by hex SHA |
+| `objects` | Git objects keyed by hex SHA. Large blobs store `data` as NULL with `total_size` set |
+| `chunks` | Deduplicated content chunks keyed by SHA-256 |
+| `object_chunks` | Maps objects to their ordered chunk sequence |
 | `refs` | Git references (branches, tags, HEAD) as byte names |
 | `peeled_refs` | Cached peeled ref values |
 | `named_files` | Control directory files (config, description, info/exclude) |
 | `metadata` | Schema version tracking |
+| `reflog` | Ref change history |
+| `chunks_fts` | *(opt-in)* FTS5 external-content index on `chunks` |
+
+Large text blobs (>4 KB) are split into content-defined chunks using line-boundary CDC. Binary blobs use FastCDC. Chunks are deduplicated by SHA-256 — shared content across blob versions is stored once.
 
 SQLite is configured with `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=5000` for good concurrent read performance.
 
@@ -151,6 +178,8 @@ uv run pytest tests/ -v
 The test suite includes:
 
 - **Dulwich's `ObjectStoreTests` mixin** — the same test suite that validates `MemoryObjectStore` and `DiskObjectStore`
+- **Chunk deduplication tests** — roundtrip, shared chunks, migration from v3
+- **FTS search tests** — LIKE fallback, FTS5 syntax, ranking, quoting, backfill, binary exclusion
 - **Ref CAS tests** — compare-and-swap, add-if-new, symbolic refs
 - **Repo tests** — init, reopen, config persistence, named files
 - **Integration tests** — full commit workflows, cross-repo fetch, branch operations
