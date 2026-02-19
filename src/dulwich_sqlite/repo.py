@@ -6,7 +6,7 @@ import time
 from collections.abc import Generator
 from io import BytesIO
 
-from dulwich import reflog
+from dulwich import porcelain, reflog
 from dulwich.errors import NoIndexPresent, NotGitRepository
 from dulwich.repo import BaseRepo
 
@@ -203,6 +203,146 @@ class SqliteRepo(BaseRepo):
 
     def _determine_file_mode(self) -> bool:
         return sys.platform != "win32"
+
+    def _save_config(self) -> None:
+        """Persist the in-memory config to the database."""
+        buf = BytesIO()
+        self._config.write_to_file(buf)
+        self._put_named_file("config", buf.getvalue())
+
+    @classmethod
+    def clone_from(
+        cls,
+        source: str,
+        db_path: str,
+        *,
+        origin: str = "origin",
+        compress: bool = False,
+        depth: int | None = None,
+        branch: str | bytes | None = None,
+        errstream: "BinaryIO | None" = None,
+    ) -> "SqliteRepo":
+        """Clone a remote repository into a new SQLite database.
+
+        Sets up remote tracking config just like ``git clone --bare``, then
+        fetches objects and refs via :func:`dulwich.porcelain.fetch`.
+
+        Args:
+            source: URL or local path of the source repository.
+            db_path: Path for the new SQLite database file.
+            origin: Name for the remote (default ``"origin"``).
+            compress: Enable zlib compression for stored objects.
+            depth: Create a shallow clone with this many commits.
+            branch: Branch to checkout as HEAD (default: remote HEAD).
+            errstream: Optional stream for progress output.
+        """
+        repo = cls.init_bare(db_path, compress=compress)
+        try:
+            # Configure the remote — same as dulwich's client.clone()
+            config = repo.get_config()
+            origin_b = origin.encode()
+            section = (b"remote", origin_b)
+            config.set(section, b"url", source.encode())
+            config.set(
+                section, b"fetch",
+                b"+refs/heads/*:refs/remotes/" + origin_b + b"/*",
+            )
+            repo._save_config()
+
+            # Fetch objects; porcelain.fetch resolves "origin" from config,
+            # calls _import_remote_refs to populate refs/remotes/origin/*.
+            kwargs: dict = {"depth": depth}
+            if errstream is not None:
+                kwargs["errstream"] = errstream
+            result = porcelain.fetch(repo, origin, **kwargs)
+
+            # Determine the default branch from the remote.
+            # Mirrors the logic in dulwich's client.clone().
+            target_ref = None
+            if branch is not None:
+                if isinstance(branch, str):
+                    branch = branch.encode()
+                if not branch.startswith(b"refs/"):
+                    branch = b"refs/heads/" + branch
+                target_ref = branch
+            elif result.symrefs and b"HEAD" in result.symrefs:
+                symref_target = result.symrefs[b"HEAD"]
+                if symref_target in result.refs:
+                    target_ref = symref_target
+
+            # Fall back: find a branch whose SHA matches remote HEAD
+            if target_ref is None:
+                head_sha = result.refs.get(b"HEAD")
+                if head_sha is not None:
+                    for ref_name, sha in result.refs.items():
+                        if (
+                            ref_name.startswith(b"refs/heads/")
+                            and sha == head_sha
+                        ):
+                            target_ref = ref_name
+                            break
+
+            # Create a local branch tracking the remote and point HEAD at it
+            if target_ref is not None and target_ref in result.refs:
+                repo.refs[target_ref] = result.refs[target_ref]
+                repo.refs.set_symbolic_ref(b"HEAD", target_ref)
+        except BaseException:
+            repo.close()
+            raise
+        return repo
+
+    def fetch(
+        self,
+        remote_location: str = "origin",
+        *,
+        depth: int | None = None,
+        errstream: "BinaryIO | None" = None,
+    ) -> "FetchPackResult":
+        """Fetch objects and refs from a remote repository.
+
+        Thin wrapper around :func:`dulwich.porcelain.fetch`.  When
+        *remote_location* is a configured remote name (e.g. ``"origin"``),
+        remote tracking refs under ``refs/remotes/<name>/`` are updated
+        automatically by dulwich.
+
+        Args:
+            remote_location: Remote name or URL.  Defaults to ``"origin"``.
+            depth: Fetch only this many commits of history.
+            errstream: Optional stream for progress output.
+
+        Returns:
+            :class:`~dulwich.client.FetchPackResult` with remote refs
+            and symrefs.
+        """
+        kwargs: dict = {"depth": depth}
+        if errstream is not None:
+            kwargs["errstream"] = errstream
+        return porcelain.fetch(self, remote_location, **kwargs)
+
+    def push(
+        self,
+        remote_location: str | None = None,
+        refspecs: str | bytes | list[str | bytes] | None = None,
+        *,
+        errstream: "BinaryIO | None" = None,
+    ) -> None:
+        """Push refs and objects to a remote repository.
+
+        Thin wrapper around :func:`dulwich.porcelain.push`.
+
+        Args:
+            remote_location: Remote name or URL.  Defaults to the
+                tracking remote of the current branch (usually ``"origin"``).
+            refspecs: Refspec(s) to push (e.g. ``"refs/heads/main"``).
+                Defaults to the current active branch.
+            errstream: Optional stream for progress output.
+        """
+        kwargs: dict = {}
+        if refspecs is not None:
+            kwargs["refspecs"] = refspecs
+        if errstream is not None:
+            kwargs["errstream"] = errstream
+        porcelain.push(self, remote_location, **kwargs)
 
     def close(self) -> None:
         self.object_store.close()
