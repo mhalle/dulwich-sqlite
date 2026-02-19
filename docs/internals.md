@@ -27,10 +27,11 @@ add_object(obj)
 For non-blob objects (commits, trees, tags) and small blobs:
 
 ```sql
-INSERT OR REPLACE INTO objects (sha, type_num, data) VALUES (?, ?, ?)
+INSERT OR REPLACE INTO objects (sha, type_num, data, total_size, compression)
+VALUES (?, ?, ?, ?, ?)
 ```
 
-The full raw object data goes in the `data` column.
+The object data goes in the `data` column (compressed if compression is enabled). `total_size` is always set to the raw (uncompressed) data size. `compression` records the method used (`'none'`, `'zlib'`, or `'zstd'`).
 
 ### Chunked Storage
 
@@ -38,8 +39,8 @@ For blobs >= 4096 bytes that produce multiple chunks:
 
 1. Insert the object row with NULL data:
    ```sql
-   INSERT OR REPLACE INTO objects (sha, type_num, data, total_size)
-   VALUES (?, ?, NULL, ?)
+   INSERT OR REPLACE INTO objects (sha, type_num, data, total_size, compression)
+   VALUES (?, ?, NULL, ?, 'none')
    ```
 
 2. Get the object's rowid and clear any existing chunk mappings (for `REPLACE` semantics):
@@ -170,10 +171,9 @@ A single database can contain chunks with different compression methods (`'none'
 
 Mixed mode is fully supported. Each chunk records its own compression method.
 
-### What's NOT Compressed
+### Inline Object Compression
 
-- Inline objects (non-blob objects and small blobs) — data stored directly in `objects.data` is never compressed
-- Only chunk data in the `chunks` table is affected by the compression setting
+Since schema v8, inline objects (commits, trees, tags, and small blobs) are also compressed when compression is enabled. The `objects` table has its own `compression` column that records the method used for each inline object's data. On read, `get_raw()` decompresses inline data using this column.
 
 ## Pack Ingestion
 

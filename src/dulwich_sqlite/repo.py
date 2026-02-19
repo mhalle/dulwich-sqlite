@@ -18,6 +18,7 @@ from ._schema import (
     migrate_v4_to_v5,
     migrate_v5_to_v6,
     migrate_v6_to_v7,
+    migrate_v7_to_v8,
 )
 from .object_store import SqliteObjectStore
 from .refs import SqliteRefsContainer
@@ -81,6 +82,9 @@ class SqliteRepo(BaseRepo):
         if version == "6":
             migrate_v6_to_v7(self._conn)
             version = "7"
+        if version == "7":
+            migrate_v7_to_v8(self._conn)
+            version = "8"
         if version != SCHEMA_VERSION:
             raise NotGitRepository(
                 f"Unsupported schema version {version} "
@@ -377,9 +381,9 @@ class SqliteRepo(BaseRepo):
             raw = self.object_store._decompress(bytes(row[0]), row[1])
             samples.append(raw)
         for row in self._conn.execute(
-            "SELECT data FROM objects WHERE data IS NOT NULL LIMIT 5000"
+            "SELECT data, compression FROM objects WHERE data IS NOT NULL LIMIT 5000"
         ):
-            samples.append(bytes(row[0]))
+            samples.append(self.object_store._decompress(bytes(row[0]), row[1]))
         if len(samples) < 10:
             return
         dict_data = zstandard.train_dictionary(dict_size, samples)

@@ -8,7 +8,7 @@ import pytest
 from dulwich.objects import Blob
 
 from dulwich_sqlite import SqliteRepo
-from dulwich_sqlite._schema import init_db, migrate_v4_to_v5, migrate_v6_to_v7
+from dulwich_sqlite._schema import init_db, migrate_v4_to_v5, migrate_v6_to_v7, migrate_v7_to_v8
 from dulwich_sqlite.object_store import SqliteObjectStore
 
 
@@ -70,12 +70,16 @@ class TestCompressedRoundtrip:
         blob = Blob.from_string(data)
         compressed_store.add_object(blob)
         row = compressed_store._conn.execute(
-            "SELECT data FROM objects WHERE sha = ?",
+            "SELECT data, compression FROM objects WHERE sha = ?",
             (blob.id.decode("ascii"),),
         ).fetchone()
-        # Small blobs are stored inline, not compressed
+        # Small blobs are stored inline (data is not NULL)
         assert row[0] is not None
-        assert bytes(row[0]) == data
+        # With compression enabled, inline data is compressed
+        assert row[1] == "zlib"
+        # Verify via get_raw roundtrip
+        type_num, retrieved = compressed_store.get_raw(blob.id)
+        assert retrieved == data
 
 
 class TestChunksInDB:
@@ -371,7 +375,7 @@ class TestMigration:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "7"
+            assert row[0] == "8"
 
             # compression metadata inserted
             row = repo._conn.execute(
@@ -679,7 +683,7 @@ class TestIntegerKeys:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "7"
+            assert row[0] == "8"
 
             # Verify integer columns
             cols = [
@@ -703,5 +707,215 @@ class TestIntegerKeys:
             type_num, data = repo.object_store.get_raw(obj_sha.encode("ascii"))
             assert type_num == 3
             assert data == chunk_data
+        finally:
+            repo.close()
+
+
+class TestInlineCompression:
+    def test_inline_object_compressed(self, tmp_path):
+        """Verify commit/tree objects are compressed when compression is enabled."""
+        from dulwich.objects import Commit, Tree
+        import time
+
+        db = str(tmp_path / "inline_comp.db")
+        repo = SqliteRepo.init_bare(db, compress="zlib")
+        try:
+            blob = Blob.from_string(b"content")
+            repo.object_store.add_object(blob)
+            tree = Tree()
+            tree.add(b"file.txt", 0o100644, blob.id)
+            repo.object_store.add_object(tree)
+            commit = Commit()
+            commit.tree = tree.id
+            commit.author = commit.committer = b"A <a@b.c>"
+            commit.author_time = commit.commit_time = int(time.time())
+            commit.author_timezone = commit.commit_timezone = 0
+            commit.encoding = b"UTF-8"
+            commit.message = b"test commit"
+            repo.object_store.add_object(commit)
+
+            # All inline objects should have compression='zlib'
+            for obj_id in [blob.id, tree.id, commit.id]:
+                row = repo._conn.execute(
+                    "SELECT compression FROM objects WHERE sha = ?",
+                    (obj_id.decode("ascii"),),
+                ).fetchone()
+                assert row[0] == "zlib", f"Expected zlib for {obj_id}"
+
+            # Verify roundtrip
+            _, r = repo.object_store.get_raw(commit.id)
+            assert r == commit.as_raw_string()
+        finally:
+            repo.close()
+
+    def test_inline_compressed_search(self, tmp_path):
+        """Verify search_content finds compressed inline blobs."""
+        db = str(tmp_path / "inline_search.db")
+        repo = SqliteRepo.init_bare(db, compress="zlib")
+        try:
+            data = b"unique_inline_keyword_here"
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            # Verify it's stored inline and compressed
+            row = repo._conn.execute(
+                "SELECT compression, data FROM objects WHERE sha = ?",
+                (blob.id.decode("ascii"),),
+            ).fetchone()
+            assert row[0] == "zlib"
+            assert row[1] is not None  # inline
+
+            results = repo.object_store.search_content("unique_inline_keyword_here")
+            assert blob.id in results
+        finally:
+            repo.close()
+
+    def test_v7_to_v8_migration(self, tmp_path):
+        """Manually create a v7 DB, open, verify migration adds compression column."""
+        db = str(tmp_path / "v7.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Create v7-style schema
+        conn.execute(
+            """
+            CREATE TABLE objects (
+                sha TEXT PRIMARY KEY NOT NULL,
+                type_num INTEGER NOT NULL,
+                data BLOB,
+                total_size INTEGER,
+                type_name TEXT GENERATED ALWAYS AS (
+                    CASE type_num
+                        WHEN 1 THEN 'commit'
+                        WHEN 2 THEN 'tree'
+                        WHEN 3 THEN 'blob'
+                        WHEN 4 THEN 'tag'
+                    END
+                ) VIRTUAL,
+                size_bytes INTEGER GENERATED ALWAYS AS (
+                    CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END
+                ) VIRTUAL,
+                is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE chunks (
+                chunk_sha TEXT PRIMARY KEY NOT NULL,
+                data BLOB NOT NULL,
+                compression TEXT NOT NULL DEFAULT 'none',
+                stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE object_chunks (
+                object_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_id INTEGER NOT NULL,
+                PRIMARY KEY (object_id, chunk_index)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX idx_object_chunks_chunk ON object_chunks (chunk_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE peeled_refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE named_files (path TEXT PRIMARY KEY NOT NULL, contents BLOB NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE reflog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ref_name BLOB NOT NULL,
+                old_sha BLOB NOT NULL,
+                new_sha BLOB NOT NULL,
+                committer BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                timezone INTEGER NOT NULL,
+                message BLOB NOT NULL,
+                ref_name_text TEXT GENERATED ALWAYS AS (cast(ref_name AS TEXT)) VIRTUAL,
+                old_sha_text TEXT GENERATED ALWAYS AS (cast(old_sha AS TEXT)) VIRTUAL,
+                new_sha_text TEXT GENERATED ALWAYS AS (cast(new_sha AS TEXT)) VIRTUAL,
+                committer_text TEXT GENERATED ALWAYS AS (cast(committer AS TEXT)) VIRTUAL,
+                message_text TEXT GENERATED ALWAYS AS (cast(message AS TEXT)) VIRTUAL,
+                datetime_text TEXT GENERATED ALWAYS AS (datetime(timestamp, 'unixepoch')) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reflog_ref ON reflog (ref_name, id)"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '7')"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('compression', 'none')"
+        )
+        # Insert test inline object (no total_size, as v7 didn't set it for inline)
+        conn.execute(
+            "INSERT INTO objects (sha, type_num, data) VALUES (?, ?, ?)",
+            ("abcd" * 10, 3, b"test inline data"),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteRepo — should trigger v7→v8 migration
+        repo = SqliteRepo(db)
+        try:
+            row = repo._conn.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            assert row[0] == "8"
+
+            # compression column exists with default 'none'
+            row = repo._conn.execute(
+                "SELECT compression FROM objects WHERE sha = ?",
+                ("abcd" * 10,),
+            ).fetchone()
+            assert row[0] == "none"
+
+            # total_size was backfilled
+            row = repo._conn.execute(
+                "SELECT total_size, size_bytes FROM objects WHERE sha = ?",
+                ("abcd" * 10,),
+            ).fetchone()
+            assert row[0] == len(b"test inline data")
+            assert row[1] == len(b"test inline data")
+
+            # Data still accessible
+            row = repo._conn.execute(
+                "SELECT data FROM objects WHERE sha = ?",
+                ("abcd" * 10,),
+            ).fetchone()
+            assert bytes(row[0]) == b"test inline data"
         finally:
             repo.close()

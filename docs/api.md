@@ -10,7 +10,7 @@
 SqliteRepo(db_path: str)
 ```
 
-Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3 through v6 databases to the current schema (v7).
+Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3 through v7 databases to the current schema (v8).
 
 **Raises:** `NotGitRepository` if the file is not a valid dulwich-sqlite database or has an unsupported schema version.
 
@@ -245,7 +245,7 @@ Returns `(type_num, raw_data)`. For chunked objects, reassembles the data from c
 store.get_object_size(sha: ObjectID | RawObjectID) -> int
 ```
 
-Returns the object's data size in bytes. For inline objects this is `length(data)`. For chunked objects this is the stored `total_size`.
+Returns the object's data size in bytes (the raw uncompressed size). Derived from `total_size`, which is always set for both inline and chunked objects.
 
 **Raises:** `KeyError` if the object does not exist.
 
@@ -303,9 +303,10 @@ store.search_content(query: str, *, limit: int | None = None) -> list[ObjectID]
 
 Searches blob content for a substring match. Returns a list of matching object SHAs.
 
-The search works in two passes:
-1. SQL `LIKE` on uncompressed chunks and inline blobs (fast, done in SQLite)
+The search works in three passes:
+1. SQL `LIKE` on uncompressed chunks and uncompressed inline blobs (fast, done in SQLite)
 2. Python-side search on compressed chunks (slower, requires decompression)
+3. Python-side search on compressed inline blobs (slower, requires decompression)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

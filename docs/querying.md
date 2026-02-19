@@ -68,13 +68,16 @@ SELECT sha, type_name, size_bytes FROM objects WHERE is_chunked;
 
 ### Reading Inline Blobs
 
-For small blobs stored inline, the data is directly in the `objects` table:
+For small blobs stored inline, the data is directly in the `objects` table. Note that inline data may be compressed — check the `compression` column:
 
 ```sql
+-- Uncompressed inline blobs can be read directly
 SELECT sha, CAST(data AS TEXT) FROM objects
-WHERE type_name = 'blob' AND NOT is_chunked
+WHERE type_name = 'blob' AND NOT is_chunked AND compression = 'none'
 LIMIT 5;
 ```
+
+For compressed inline blobs, use the Python API or decompress in your application based on the `compression` column value (`'zlib'` or `'zstd'`).
 
 ### Reassembling Chunked Blobs
 
@@ -167,15 +170,18 @@ GROUP BY compression;
 
 ### Search Inline Blobs
 
-Search for a substring in inline (non-chunked) blobs:
+Search for a substring in uncompressed inline blobs:
 
 ```sql
 SELECT sha
 FROM objects
 WHERE type_name = 'blob'
   AND NOT is_chunked
+  AND compression = 'none'
   AND CAST(data AS TEXT) LIKE '%def main%';
 ```
+
+**Note:** SQL `LIKE` only works on uncompressed inline blobs (`compression = 'none'`). Compressed inline blobs require Python-side decompression for searching.
 
 ### Search Uncompressed Chunks
 
@@ -188,7 +194,7 @@ WHERE c.compression = 'none'
   AND CAST(c.data AS TEXT) LIKE '%TODO%';
 ```
 
-### Combined Search (Inline + Uncompressed Chunks)
+### Combined Search (Uncompressed Inline + Uncompressed Chunks)
 
 This matches what `search_content()` does for the SQL portion:
 
@@ -199,9 +205,11 @@ JOIN objects o ON o.rowid = oc.object_id
 WHERE c.compression = 'none' AND CAST(c.data AS TEXT) LIKE '%search_term%'
 UNION
 SELECT sha FROM objects
-WHERE NOT is_chunked AND type_name = 'blob'
+WHERE NOT is_chunked AND type_name = 'blob' AND compression = 'none'
   AND CAST(data AS TEXT) LIKE '%search_term%';
 ```
+
+`search_content()` also does Python-side decompression for compressed chunks and compressed inline blobs.
 
 ### Compressed Chunks
 

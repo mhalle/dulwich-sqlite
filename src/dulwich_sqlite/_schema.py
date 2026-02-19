@@ -2,7 +2,7 @@
 
 import sqlite3
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -17,6 +17,7 @@ CREATE_TABLES = [
         type_num INTEGER NOT NULL,
         data BLOB,
         total_size INTEGER,
+        compression TEXT NOT NULL DEFAULT 'none',
         type_name TEXT GENERATED ALWAYS AS (
             CASE type_num
                 WHEN 1 THEN 'commit'
@@ -25,9 +26,7 @@ CREATE_TABLES = [
                 WHEN 4 THEN 'tag'
             END
         ) VIRTUAL,
-        size_bytes INTEGER GENERATED ALWAYS AS (
-            CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END
-        ) VIRTUAL,
+        size_bytes INTEGER GENERATED ALWAYS AS (total_size) VIRTUAL,
         is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
     )
     """,
@@ -274,5 +273,63 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
+    )
+    conn.commit()
+
+
+def migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """Migrate a v7 database to v8 schema.
+
+    Adds compression column to objects table and changes size_bytes to use
+    total_size instead of length(data), since inline objects may now be compressed.
+    """
+    # Add compression column
+    conn.execute(
+        "ALTER TABLE objects ADD COLUMN compression TEXT NOT NULL DEFAULT 'none'"
+    )
+    # Backfill total_size for inline objects
+    conn.execute(
+        "UPDATE objects SET total_size = length(data) WHERE data IS NOT NULL AND total_size IS NULL"
+    )
+    # Recreate objects table to change size_bytes generated column
+    conn.execute("ALTER TABLE objects RENAME TO _objects_v7")
+    conn.execute(
+        """
+        CREATE TABLE objects (
+            sha TEXT PRIMARY KEY NOT NULL,
+            type_num INTEGER NOT NULL,
+            data BLOB,
+            total_size INTEGER,
+            compression TEXT NOT NULL DEFAULT 'none',
+            type_name TEXT GENERATED ALWAYS AS (
+                CASE type_num
+                    WHEN 1 THEN 'commit'
+                    WHEN 2 THEN 'tree'
+                    WHEN 3 THEN 'blob'
+                    WHEN 4 THEN 'tag'
+                END
+            ) VIRTUAL,
+            size_bytes INTEGER GENERATED ALWAYS AS (total_size) VIRTUAL,
+            is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO objects (sha, type_num, data, total_size, compression) "
+        "SELECT sha, type_num, data, total_size, compression FROM _objects_v7"
+    )
+    # Update object_chunks references to use new rowids
+    conn.execute(
+        """
+        UPDATE object_chunks SET object_id = (
+            SELECT o_new.rowid FROM objects o_new
+            JOIN _objects_v7 o_old ON o_old.sha = o_new.sha
+            WHERE o_old.rowid = object_chunks.object_id
+        )
+        """
+    )
+    conn.execute("DROP TABLE _objects_v7")
+    conn.execute(
+        "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
     )
     conn.commit()

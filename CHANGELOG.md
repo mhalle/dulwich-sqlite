@@ -2,6 +2,18 @@
 
 All notable changes to dulwich-sqlite are documented in this file.
 
+## [0.3.1] — 2026-02-19
+
+### Changed
+
+- **Schema v8**: Inline objects (commits, trees, tags, small blobs) are now compressed when compression is enabled
+  - New `compression` column on `objects` table tracks per-object compression method
+  - `total_size` is now always set for inline objects (raw uncompressed size)
+  - `size_bytes` generated column uses `total_size` instead of `length(data)` to report correct size for compressed inline data
+  - Automatic migration from v7 on open (recreates objects table to change generated column)
+  - `search_content()` handles compressed inline blobs via Python-side decompression
+  - `train_dictionary()` decompresses inline objects when sampling
+
 ## [0.3.0] — 2026-02-19
 
 ### Added

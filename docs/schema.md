@@ -4,7 +4,7 @@ dulwich-sqlite stores all repository data in a single SQLite database. This docu
 
 ## Schema Version
 
-The current schema version is **7**. The version is stored in the `metadata` table under the key `schema_version`.
+The current schema version is **8**. The version is stored in the `metadata` table under the key `schema_version`.
 
 ### Version History
 
@@ -15,8 +15,9 @@ The current schema version is **7**. The version is stored in the `metadata` tab
 | v5 | Added compression: `compression` column on `chunks` table. `compression` key added to `metadata` |
 | v6 | Added convenience generated columns: `objects.is_chunked`, `chunks.stored_size`, `reflog.old_sha_text`, `reflog.new_sha_text`, `reflog.committer_text`, `reflog.datetime_text` |
 | v7 | Integer keys in `object_chunks`: replaced `object_sha`/`chunk_sha` text columns with `object_id`/`chunk_id` integer rowid references. Added zstd compression support |
+| v8 | Inline object compression: added `compression` column to `objects` table. Changed `size_bytes` to use `total_size` (always set). Inline objects (commits, trees, tags, small blobs) are now compressed when compression is enabled |
 
-Migration from v3 through v6 happens automatically when opening a database with `SqliteRepo()`.
+Migration from v3 through v7 happens automatically when opening a database with `SqliteRepo()`.
 
 ## Pragmas
 
@@ -46,6 +47,7 @@ CREATE TABLE objects (
     type_num INTEGER NOT NULL,
     data BLOB,
     total_size INTEGER,
+    compression TEXT NOT NULL DEFAULT 'none',
     type_name TEXT GENERATED ALWAYS AS (
         CASE type_num
             WHEN 1 THEN 'commit'
@@ -54,9 +56,7 @@ CREATE TABLE objects (
             WHEN 4 THEN 'tag'
         END
     ) VIRTUAL,
-    size_bytes INTEGER GENERATED ALWAYS AS (
-        CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END
-    ) VIRTUAL,
+    size_bytes INTEGER GENERATED ALWAYS AS (total_size) VIRTUAL,
     is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
 );
 ```
@@ -65,17 +65,19 @@ CREATE TABLE objects (
 |---|---|---|
 | `sha` | TEXT PK | Hex-encoded SHA-1 of the Git object |
 | `type_num` | INTEGER | Git object type: 1=commit, 2=tree, 3=blob, 4=tag |
-| `data` | BLOB (nullable) | Raw object data. NULL for chunked blobs (data is in the `chunks` table) |
-| `total_size` | INTEGER (nullable) | Total data size for chunked blobs. NULL for inline objects |
+| `data` | BLOB (nullable) | Object data, possibly compressed. NULL for chunked blobs (data is in the `chunks` table) |
+| `total_size` | INTEGER | Total raw (uncompressed) data size in bytes. Always set for both inline and chunked objects |
+| `compression` | TEXT | Compression method for inline data: `'none'`, `'zlib'`, or `'zstd'`. Always `'none'` for chunked objects (their chunks have their own compression) |
 | `type_name` | TEXT (generated) | Human-readable type name derived from `type_num` |
-| `size_bytes` | INTEGER (generated) | Object size: `length(data)` for inline, `total_size` for chunked |
+| `size_bytes` | INTEGER (generated) | Object size in bytes, derived from `total_size` |
 | `is_chunked` | INTEGER (generated) | 1 if the object is chunked (data is NULL), 0 if inline |
 
 **Notes:**
-- Inline objects have `data` populated and `total_size` as NULL
+- Inline objects have `data` populated and `total_size` set to the raw data size
 - Chunked objects have `data` as NULL and `total_size` set to the total reassembled size
 - Non-blob objects (commits, trees, tags) are always stored inline
 - Only blobs >= 4096 bytes that produce multiple chunks are stored in chunked form
+- When compression is enabled, inline data is compressed; decompress using the `compression` column value
 
 ### `chunks`
 
@@ -204,7 +206,7 @@ CREATE TABLE metadata (
 
 | Key | Values | Description |
 |---|---|---|
-| `schema_version` | `"3"` through `"7"` | Current schema version |
+| `schema_version` | `"3"` through `"8"` | Current schema version |
 | `compression` | `"none"`, `"zlib"`, `"zstd"` | Current compression setting for new chunks |
 
 ### `reflog`
@@ -302,3 +304,15 @@ Replaced text SHA columns in `object_chunks` with integer rowid references:
 5. Schema version updated to `"7"`
 
 This migration significantly reduces `object_chunks` storage overhead by replacing 40+ byte text SHA columns with ~3 byte integer rowid references.
+
+### v7 to v8
+
+Added inline object compression:
+
+1. `compression TEXT NOT NULL DEFAULT 'none'` column added to `objects` via `ALTER TABLE`
+2. `total_size` backfilled for inline objects: `UPDATE objects SET total_size = length(data) WHERE data IS NOT NULL AND total_size IS NULL`
+3. `objects` table recreated to change `size_bytes` generated column from `CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END` to simply `total_size`
+4. `object_chunks` references updated to match new rowids
+5. Schema version updated to `"8"`
+
+The table recreation is needed because SQLite cannot alter generated column expressions in place. The `size_bytes` column now uses `total_size` because inline data may be compressed, so `length(data)` would return the compressed size rather than the original size.

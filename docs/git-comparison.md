@@ -23,7 +23,7 @@ These aspects work exactly the same as standard Git:
 | Filesystem layout | `.git/objects/`, `.git/refs/`, etc. | No filesystem layout |
 | Packfiles | Delta-compressed packs with idx files | No packfiles — objects are stored individually |
 | Loose objects | Individual files in `objects/xx/yyyy...` | Rows in the `objects` table |
-| Object compression | zlib per loose object, delta chains in packs | Optional zstd or zlib per chunk (not per object) |
+| Object compression | zlib per loose object, delta chains in packs | Optional zstd or zlib per chunk and per inline object |
 
 ### Always Bare
 
@@ -111,10 +111,11 @@ When an object is replaced (via `INSERT OR REPLACE`), its old chunk mappings are
 | Aspect | Off | zlib | zstd |
 |---|---|---|---|
 | Database size | Largest | ~40-60% smaller | ~55-65% smaller (with dictionary) |
-| SQL search | `LIKE` works on all data | Compressed chunks need Python decompression | Compressed chunks need Python decompression |
+| Compressed data | Nothing | Chunks and inline objects | Chunks and inline objects |
+| SQL search | `LIKE` works on all data | Compressed data needs Python decompression | Compressed data needs Python decompression |
 | Write speed | Fastest | Slower | Faster than zlib |
 | Read speed | Direct reads | Decompression needed | Decompression needed (faster than zlib) |
 | Dictionary support | N/A | No | Yes — trained dictionaries improve ratios further |
 | Mixed mode | N/A | All methods coexist | All methods coexist |
 
-**Recommendation**: Use `compress=True` (zstd) for most repositories. It provides the best compression ratios with fast performance. Leave compression off only when fast SQL `LIKE` queries on chunk content are critical.
+**Recommendation**: Use `compress=True` (zstd) for most repositories. It provides the best compression ratios with fast performance. Both chunk data and inline objects (commits, trees, tags, small blobs) are compressed. Leave compression off only when fast SQL `LIKE` queries on all content are critical.
