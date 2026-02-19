@@ -357,13 +357,13 @@ class TestMigration:
         conn.commit()
         conn.close()
 
-        # Open with SqliteRepo — should trigger v4→v5 migration
+        # Open with SqliteRepo — should trigger v4→v5→v6 migration
         repo = SqliteRepo(db)
         try:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "5"
+            assert row[0] == "6"
 
             # compression metadata inserted
             row = repo._conn.execute(

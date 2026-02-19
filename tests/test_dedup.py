@@ -226,11 +226,11 @@ class TestMigration:
         # Open with SqliteRepo — should trigger migration
         repo = SqliteRepo(db)
         try:
-            # Verify version is now 4
+            # Verify version is now 6 (v3→v4→v5→v6 chain)
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "5"
+            assert row[0] == "6"
 
             # Verify old data is still accessible
             row = repo._conn.execute(

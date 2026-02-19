@@ -19,27 +19,24 @@ pip install dulwich-sqlite
 
 Requires Python 3.12+ and `dulwich >= 1.0.0`, `fastcdc`. SQLite is in the standard library.
 
-## Quick start
-
-### Create a repository
+## Quick Start
 
 ```python
 from dulwich_sqlite import SqliteRepo
 from dulwich.objects import Blob, Tree, Commit
 import time
 
+# Create a repository
 repo = SqliteRepo.init_bare("my-repo.db")
 
-# Store a blob
+# Store a blob, tree, and commit
 blob = Blob.from_string(b"hello world")
 repo.object_store.add_object(blob)
 
-# Build a tree
 tree = Tree()
 tree.add(b"greeting.txt", 0o100644, blob.id)
 repo.object_store.add_object(tree)
 
-# Create a commit
 commit = Commit()
 commit.tree = tree.id
 commit.author = commit.committer = b"Alice <alice@example.com>"
@@ -49,108 +46,26 @@ commit.encoding = b"UTF-8"
 commit.message = b"Initial commit"
 repo.object_store.add_object(commit)
 
-# Point a branch at the commit
 repo.refs[b"refs/heads/main"] = commit.id
-
 repo.close()
-```
 
-### Reopen and read back
-
-```python
+# Reopen and read back
 repo = SqliteRepo("my-repo.db")
-
 head = repo.refs[b"refs/heads/main"]
-commit = repo.object_store[head]
-print(commit.message)  # b"Initial commit"
-
+print(repo.object_store[head].message)  # b"Initial commit"
 repo.close()
 ```
 
-### Use as a context manager
+## Documentation
 
-```python
-with SqliteRepo.init_bare("/tmp/repo.db") as repo:
-    blob = Blob.from_string(b"data")
-    repo.object_store.add_object(blob)
-```
-
-### Fetch from another repository
-
-```python
-from dulwich.repo import MemoryRepo
-
-source = MemoryRepo.init_bare([], {})
-# ... add objects and refs to source ...
-
-target = SqliteRepo.init_bare("fetched.db")
-source.fetch(target)  # transfers all reachable objects via pack protocol
-target.close()
-```
-
-## API
-
-### `SqliteRepo`
-
-| Method | Description |
+| Document | Description |
 |---|---|
-| `SqliteRepo.init_bare(db_path)` | Create a new bare repository in a SQLite file |
-| `SqliteRepo(db_path)` | Open an existing repository |
-| `repo.object_store` | `SqliteObjectStore` instance for reading/writing git objects |
-| `repo.refs` | `SqliteRefsContainer` instance for branches, tags, HEAD |
-| `repo.get_config()` | Returns the repository `ConfigFile` |
-| `repo.get_description()` | Returns the repository description as bytes |
-| `repo.set_description(desc)` | Sets the repository description |
-| `repo.close()` | Closes the SQLite connection |
-
-### `SqliteObjectStore`
-
-Extends `PackCapableObjectStore`. Supports the full Dulwich object store interface:
-
-- `add_object(obj)` / `add_objects([(obj, path), ...])` — store git objects
-- `obj in store` / `store[sha]` — check existence / retrieve objects
-- `store.get_raw(sha)` — returns `(type_num, data)` tuple
-- `iter(store)` — iterate over all stored object SHAs
-- `add_pack()` / `add_pack_data()` / `add_thin_pack()` — ingest pack data (used by fetch/push)
-
-Pack data is never stored as-is. Incoming packs are unpacked into individual objects via `PackInflater`, matching how `MemoryObjectStore` works.
-
-#### Content search
-
-```python
-# Substring search across all blob content
-results = repo.object_store.search_content("def main")
-results = repo.object_store.search_content("error", limit=10)
-```
-
-Searches both inline blobs and chunked blobs via SQL `LIKE`.
-
-### `SqliteRefsContainer`
-
-Extends `RefsContainer`. Supports:
-
-- `refs[name] = sha` / `del refs[name]` — set/delete refs
-- `refs.allkeys()` — all ref names
-- `set_if_equals(name, old, new)` — compare-and-swap
-- `add_if_new(name, ref)` — create only if absent
-- `remove_if_equals(name, old)` — delete only if matching
-- `set_symbolic_ref(name, target)` — create symbolic refs (e.g., HEAD)
-
-## Schema
-
-| Table | Purpose |
-|---|---|
-| `objects` | Git objects keyed by hex SHA. Large blobs store `data` as NULL with `total_size` set |
-| `chunks` | Deduplicated content chunks keyed by SHA-256 |
-| `object_chunks` | Maps objects to their ordered chunk sequence |
-| `refs` | Git references (branches, tags, HEAD) as byte names |
-| `peeled_refs` | Cached peeled ref values |
-| `named_files` | Control directory files (config, description, info/exclude) |
-| `metadata` | Schema version tracking |
-| `reflog` | Ref change history |
-Large text blobs (>4 KB) are split into content-defined chunks using line-boundary CDC. Binary blobs use FastCDC. Chunks are deduplicated by SHA-256 — shared content across blob versions is stored once.
-
-SQLite is configured with `journal_mode=WAL`, `synchronous=NORMAL`, and `busy_timeout=5000` for good concurrent read performance.
+| [Getting Started](docs/getting-started.md) | Installation, creating repos, storing and reading objects, cloning, fetch/push, compression |
+| [API Reference](docs/api.md) | Full reference for `SqliteRepo`, `SqliteObjectStore`, and `SqliteRefsContainer` |
+| [Database Schema](docs/schema.md) | All 8 tables, columns, generated columns, indexes, pragmas, migrations |
+| [Querying](docs/querying.md) | SQL examples for exploring objects, chunks, refs, text search, and storage analysis |
+| [Internals](docs/internals.md) | Chunking algorithms, deduplication, compression, pack ingestion, transaction model |
+| [Git Comparison](docs/git-comparison.md) | What's identical to standard Git, what's different, strengths, and limitations |
 
 ## Development
 

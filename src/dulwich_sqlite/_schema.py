@@ -2,7 +2,7 @@
 
 import sqlite3
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -27,14 +27,16 @@ CREATE_TABLES = [
         ) VIRTUAL,
         size_bytes INTEGER GENERATED ALWAYS AS (
             CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END
-        ) VIRTUAL
+        ) VIRTUAL,
+        is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS chunks (
         chunk_sha TEXT PRIMARY KEY NOT NULL,
         data BLOB NOT NULL,
-        compression TEXT NOT NULL DEFAULT 'none'
+        compression TEXT NOT NULL DEFAULT 'none',
+        stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
     )
     """,
     """
@@ -89,7 +91,11 @@ CREATE_TABLES = [
         timezone INTEGER NOT NULL,
         message BLOB NOT NULL,
         ref_name_text TEXT GENERATED ALWAYS AS (cast(ref_name AS TEXT)) VIRTUAL,
-        message_text TEXT GENERATED ALWAYS AS (cast(message AS TEXT)) VIRTUAL
+        old_sha_text TEXT GENERATED ALWAYS AS (cast(old_sha AS TEXT)) VIRTUAL,
+        new_sha_text TEXT GENERATED ALWAYS AS (cast(new_sha AS TEXT)) VIRTUAL,
+        committer_text TEXT GENERATED ALWAYS AS (cast(committer AS TEXT)) VIRTUAL,
+        message_text TEXT GENERATED ALWAYS AS (cast(message AS TEXT)) VIRTUAL,
+        datetime_text TEXT GENERATED ALWAYS AS (datetime(timestamp, 'unixepoch')) VIRTUAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_reflog_ref ON reflog (ref_name, id)",
@@ -196,5 +202,40 @@ def migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
+    )
+    conn.commit()
+
+
+def migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """Migrate a v5 database to v6 schema.
+
+    Adds generated convenience columns to objects, chunks, and reflog.
+    """
+    conn.execute(
+        "ALTER TABLE objects ADD COLUMN "
+        "is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL"
+    )
+    conn.execute(
+        "ALTER TABLE chunks ADD COLUMN "
+        "stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL"
+    )
+    conn.execute(
+        "ALTER TABLE reflog ADD COLUMN "
+        "old_sha_text TEXT GENERATED ALWAYS AS (cast(old_sha AS TEXT)) VIRTUAL"
+    )
+    conn.execute(
+        "ALTER TABLE reflog ADD COLUMN "
+        "new_sha_text TEXT GENERATED ALWAYS AS (cast(new_sha AS TEXT)) VIRTUAL"
+    )
+    conn.execute(
+        "ALTER TABLE reflog ADD COLUMN "
+        "committer_text TEXT GENERATED ALWAYS AS (cast(committer AS TEXT)) VIRTUAL"
+    )
+    conn.execute(
+        "ALTER TABLE reflog ADD COLUMN "
+        "datetime_text TEXT GENERATED ALWAYS AS (datetime(timestamp, 'unixepoch')) VIRTUAL"
+    )
+    conn.execute(
+        "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
     )
     conn.commit()
