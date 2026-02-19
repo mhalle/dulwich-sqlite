@@ -1,6 +1,7 @@
 """SQLite-backed object store for Dulwich."""
 
 import sqlite3
+import zlib
 from collections.abc import Callable, Iterable, Iterator
 from typing import BinaryIO, cast
 
@@ -28,6 +29,10 @@ class SqliteObjectStore(PackCapableObjectStore):
         super().__init__()
         self._conn = conn
         self.pack_compression_level = -1
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'compression'"
+        ).fetchone()
+        self._compression: str = row[0] if row is not None else "none"
 
     def _to_hexsha(self, sha: ObjectID | RawObjectID) -> ObjectID:
         if len(sha) == self.object_format.hex_length:
@@ -36,6 +41,13 @@ class SqliteObjectStore(PackCapableObjectStore):
             return sha_to_hex(cast(RawObjectID, sha))
         else:
             raise ValueError(f"Invalid sha {sha!r}")
+
+    def _decompress(self, data: bytes, method: str) -> bytes:
+        if method == "none":
+            return data
+        if method == "zlib":
+            return zlib.decompress(data)
+        raise ValueError(f"Unknown compression method: {method}")
 
     def contains_loose(self, sha: ObjectID | RawObjectID) -> bool:
         hexsha = self._to_hexsha(sha)
@@ -81,12 +93,15 @@ class SqliteObjectStore(PackCapableObjectStore):
         # Reassemble from chunks
         sha_str = hexsha.decode("ascii")
         chunk_rows = self._conn.execute(
-            "SELECT c.data FROM object_chunks oc "
+            "SELECT c.data, c.compression FROM object_chunks oc "
             "JOIN chunks c ON oc.chunk_sha = c.chunk_sha "
             "WHERE oc.object_sha = ? ORDER BY oc.chunk_index",
             (sha_str,),
         ).fetchall()
-        return type_num, b"".join(bytes(r[0]) for r in chunk_rows)
+        parts = []
+        for data, compression in chunk_rows:
+            parts.append(self._decompress(bytes(data), compression))
+        return type_num, b"".join(parts)
 
     def _insert_object(self, obj: ShaFile) -> None:
         """Insert a single object without committing the transaction."""
@@ -109,9 +124,14 @@ class SqliteObjectStore(PackCapableObjectStore):
                 (sha_str, obj.type_num, len(raw_data)),
             )
             for idx, (chunk_sha, chunk_data) in enumerate(chunks):
+                if self._compression == "zlib":
+                    stored_data = zlib.compress(chunk_data)
+                else:
+                    stored_data = chunk_data
                 self._conn.execute(
-                    "INSERT OR IGNORE INTO chunks (chunk_sha, data) VALUES (?, ?)",
-                    (chunk_sha, chunk_data),
+                    "INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) "
+                    "VALUES (?, ?, ?)",
+                    (chunk_sha, stored_data, self._compression),
                 )
                 self._conn.execute(
                     "INSERT INTO object_chunks (object_sha, chunk_index, chunk_sha) "
@@ -217,17 +237,33 @@ class SqliteObjectStore(PackCapableObjectStore):
             query: Substring to search for in blob content.
             limit: Maximum number of results to return.
         """
+        results: set[str] = set()
+
+        # 1. SQL LIKE on uncompressed chunks + inline objects
         sql = """
             SELECT DISTINCT oc.object_sha FROM chunks c
             JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha
-            WHERE CAST(c.data AS TEXT) LIKE ?
+            WHERE c.compression = 'none' AND CAST(c.data AS TEXT) LIKE ?
             UNION
             SELECT sha FROM objects
             WHERE data IS NOT NULL AND type_num = 3
               AND CAST(data AS TEXT) LIKE ?
         """
+        for row in self._conn.execute(sql, [f"%{query}%", f"%{query}%"]).fetchall():
+            results.add(row[0])
+
+        # 2. Python-side search on compressed chunks
+        query_bytes = query.encode("utf-8", errors="surrogateescape")
+        for row in self._conn.execute(
+            "SELECT DISTINCT oc.object_sha, c.data, c.compression FROM chunks c "
+            "JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha "
+            "WHERE c.compression != 'none'"
+        ).fetchall():
+            if row[0] not in results:
+                if query_bytes in self._decompress(bytes(row[1]), row[2]):
+                    results.add(row[0])
+
+        out = list(results)
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
-        params = [f"%{query}%", f"%{query}%"]
-        rows = self._conn.execute(sql, params).fetchall()
-        return [r[0].encode("ascii") for r in rows]
+            out = out[: int(limit)]
+        return [r.encode("ascii") for r in out]

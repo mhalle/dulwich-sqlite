@@ -15,6 +15,7 @@ from ._schema import (
     apply_pragmas,
     init_db,
     migrate_v3_to_v4,
+    migrate_v4_to_v5,
 )
 from .object_store import SqliteObjectStore
 from .refs import SqliteRefsContainer
@@ -28,9 +29,19 @@ class SqliteRepo(BaseRepo):
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
+        self.path = db_path
         self._conn = sqlite3.connect(db_path)
-        apply_pragmas(self._conn)
-        self._verify_schema()
+        try:
+            apply_pragmas(self._conn)
+            self._verify_schema()
+        except NotGitRepository:
+            self._conn.close()
+            raise
+        except sqlite3.DatabaseError:
+            self._conn.close()
+            raise NotGitRepository(
+                f"Not a dulwich-sqlite repository: {self._db_path}"
+            )
         object_store = SqliteObjectStore(self._conn)
         refs_container = SqliteRefsContainer(self._conn, logger=self._write_reflog)
         super().__init__(object_store, refs_container)
@@ -40,25 +51,33 @@ class SqliteRepo(BaseRepo):
     def _verify_schema(self) -> None:
         """Check that the database has been initialized with our schema.
 
-        Automatically migrates v3 databases to v4.
+        Automatically migrates v3 and v4 databases to the current version.
+        Raises NotGitRepository for missing/invalid schemas or unsupported versions.
         """
         try:
             row = self._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
         except sqlite3.OperationalError:
-            self._conn.close()
             raise NotGitRepository(
                 f"Not a dulwich-sqlite repository: {self._db_path}"
             )
         if row is None:
-            self._conn.close()
             raise NotGitRepository(
                 f"Not a dulwich-sqlite repository: {self._db_path}"
             )
         version = row[0]
         if version == "3":
             migrate_v3_to_v4(self._conn)
+            version = "4"
+        if version == "4":
+            migrate_v4_to_v5(self._conn)
+            version = "5"
+        if version != SCHEMA_VERSION:
+            raise NotGitRepository(
+                f"Unsupported schema version {version} "
+                f"(expected {SCHEMA_VERSION}): {self._db_path}"
+            )
 
     def _write_reflog(
         self,
@@ -105,13 +124,35 @@ class SqliteRepo(BaseRepo):
             self._config = ConfigFile()
 
     @classmethod
-    def init_bare(cls, db_path: str) -> "SqliteRepo":
+    def init_bare(cls, db_path: str, *, compress: bool = False) -> "SqliteRepo":
         conn = sqlite3.connect(db_path)
         init_db(conn)
+        if compress:
+            conn.execute(
+                "UPDATE metadata SET value = 'zlib' WHERE key = 'compression'"
+            )
+            conn.commit()
         conn.close()
         repo = cls(db_path)
         repo._init_files(bare=True)
         return repo
+
+    def enable_compression(self, method: str = "zlib") -> None:
+        if method not in ("zlib",):
+            raise ValueError(f"Unsupported compression method: {method}")
+        self._conn.execute(
+            "UPDATE metadata SET value = ? WHERE key = 'compression'",
+            (method,),
+        )
+        self._conn.commit()
+        self.object_store._compression = method
+
+    def disable_compression(self) -> None:
+        self._conn.execute(
+            "UPDATE metadata SET value = 'none' WHERE key = 'compression'"
+        )
+        self._conn.commit()
+        self.object_store._compression = "none"
 
     def get_named_file(
         self,

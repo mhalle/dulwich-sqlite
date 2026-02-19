@@ -182,6 +182,17 @@ class TestReflog:
         assert log[0][0] == b"HEAD"
         assert log[0][6] == b"checkout"
 
+    def test_unconditional_set_logs_correct_old_value(self, logged_refs):
+        """Unconditional set_if_equals logs the actual old value atomically."""
+        container, log = logged_refs
+        sha1 = b"a" * 40
+        sha2 = b"b" * 40
+        container.set_if_equals(b"refs/heads/main", None, sha1, message=b"first")
+        container.set_if_equals(b"refs/heads/main", None, sha2, message=b"second")
+        assert len(log) == 2
+        assert log[1][1] == sha1
+        assert log[1][2] == sha2
+
     def test_no_log_without_message(self, logged_refs):
         """RefsContainer._log skips logging when message is None."""
         container, log = logged_refs

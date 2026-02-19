@@ -53,3 +53,30 @@ class TestGetObjectSize:
     def test_get_object_size_missing(self, store):
         with pytest.raises(KeyError):
             store.get_object_size(b"a" * 40)
+
+
+class TestAddObjectsRollback:
+    @pytest.fixture
+    def store(self):
+        conn = sqlite3.connect(":memory:")
+        init_db(conn)
+        s = SqliteObjectStore(conn)
+        yield s
+        s.close()
+        conn.close()
+
+    def test_add_objects_rollback_on_failure(self, store):
+        """add_objects rolls back all objects if one fails mid-import."""
+        good_blob = Blob.from_string(b"good data")
+
+        class BadObject:
+            id = b"f" * 40
+            type_num = 3
+            def as_raw_string(self):
+                raise RuntimeError("simulated failure")
+
+        objects = [(good_blob, None), (BadObject(), None)]
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            store.add_objects(objects)
+
+        assert not store.contains_loose(good_blob.id)

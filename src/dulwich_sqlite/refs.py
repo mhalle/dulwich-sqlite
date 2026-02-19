@@ -42,13 +42,18 @@ class SqliteRefsContainer(RefsContainer):
         timezone: int | None = None,
         message: bytes | None = None,
     ) -> None:
-        old = self.follow(name)[-1]
         new = SYMREF + other
-        self._conn.execute(
-            "INSERT OR REPLACE INTO refs (name, value) VALUES (?, ?)",
-            (name, new),
-        )
-        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            old = self.follow(name)[-1]
+            self._conn.execute(
+                "INSERT OR REPLACE INTO refs (name, value) VALUES (?, ?)",
+                (name, new),
+            )
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
         self._log(
             name,
             old,
@@ -72,12 +77,21 @@ class SqliteRefsContainer(RefsContainer):
         self._check_refname(name)
         if old_ref is None:
             # Unconditional set — grab old value for logging, then upsert.
-            old = self.read_loose_ref(name)
-            self._conn.execute(
-                "INSERT OR REPLACE INTO refs (name, value) VALUES (?, ?)",
-                (name, new_ref),
-            )
-            self._conn.commit()
+            # BEGIN IMMEDIATE ensures the read and write are atomic.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT value FROM refs WHERE name = ?", (name,)
+                ).fetchone()
+                old = bytes(row[0]) if row is not None else None
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO refs (name, value) VALUES (?, ?)",
+                    (name, new_ref),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         else:
             # Atomic compare-and-swap: UPDATE only the row matching both
             # name and expected old value in a single statement.
@@ -155,9 +169,18 @@ class SqliteRefsContainer(RefsContainer):
     ) -> bool:
         if old_ref is None:
             # Unconditional delete — grab old value for logging.
-            old = self.read_loose_ref(name)
-            self._conn.execute("DELETE FROM refs WHERE name = ?", (name,))
-            self._conn.commit()
+            # BEGIN IMMEDIATE ensures the read and write are atomic.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT value FROM refs WHERE name = ?", (name,)
+                ).fetchone()
+                old = bytes(row[0]) if row is not None else None
+                self._conn.execute("DELETE FROM refs WHERE name = ?", (name,))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         else:
             # Atomic compare-and-delete in a single statement.
             old = old_ref

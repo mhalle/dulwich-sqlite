@@ -2,7 +2,7 @@
 
 import sqlite3
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -33,7 +33,8 @@ CREATE_TABLES = [
     """
     CREATE TABLE IF NOT EXISTS chunks (
         chunk_sha TEXT PRIMARY KEY NOT NULL,
-        data BLOB NOT NULL
+        data BLOB NOT NULL,
+        compression TEXT NOT NULL DEFAULT 'none'
     )
     """,
     """
@@ -105,6 +106,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
         ("schema_version", SCHEMA_VERSION),
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
+        ("compression", "none"),
+    )
     conn.commit()
 
 
@@ -172,7 +177,24 @@ def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     )
 
     conn.execute(
-        "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
-        (SCHEMA_VERSION,),
+        "UPDATE metadata SET value = '4' WHERE key = 'schema_version'",
+    )
+    conn.commit()
+
+
+def migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """Migrate a v4 database to v5 schema.
+
+    Adds the compression column to the chunks table and compression metadata.
+    """
+    conn.execute(
+        "ALTER TABLE chunks ADD COLUMN compression TEXT NOT NULL DEFAULT 'none'"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)",
+        ("compression", "none"),
+    )
+    conn.execute(
+        "UPDATE metadata SET value = '5' WHERE key = 'schema_version'",
     )
     conn.commit()

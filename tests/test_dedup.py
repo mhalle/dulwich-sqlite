@@ -230,7 +230,7 @@ class TestMigration:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "4"
+            assert row[0] == "5"
 
             # Verify old data is still accessible
             row = repo._conn.execute(

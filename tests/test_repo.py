@@ -115,6 +115,24 @@ class TestSqliteRepo:
         assert entries[1].old_sha == blob1.id
         assert entries[1].new_sha == blob2.id
 
+    def test_open_non_sqlite_file_raises(self, tmp_path):
+        db_path = str(tmp_path / "not_a_db.db")
+        with open(db_path, "w") as f:
+            f.write("This is not a SQLite database.")
+        with pytest.raises(NotGitRepository):
+            SqliteRepo(db_path)
+
+    def test_open_future_schema_version_raises(self, tmp_path):
+        db_path = str(tmp_path / "future.db")
+        repo = SqliteRepo.init_bare(db_path)
+        repo._conn.execute(
+            "UPDATE metadata SET value = '99' WHERE key = 'schema_version'"
+        )
+        repo._conn.commit()
+        repo.close()
+        with pytest.raises(NotGitRepository, match="Unsupported schema version"):
+            SqliteRepo(db_path)
+
     def test_read_reflog_empty(self, sqlite_repo):
         entries = list(sqlite_repo.read_reflog(b"refs/heads/nonexistent"))
         assert entries == []
