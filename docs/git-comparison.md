@@ -23,7 +23,7 @@ These aspects work exactly the same as standard Git:
 | Filesystem layout | `.git/objects/`, `.git/refs/`, etc. | No filesystem layout |
 | Packfiles | Delta-compressed packs with idx files | No packfiles — objects are stored individually |
 | Loose objects | Individual files in `objects/xx/yyyy...` | Rows in the `objects` table |
-| Object compression | zlib per loose object, delta chains in packs | Optional zlib per chunk (not per object) |
+| Object compression | zlib per loose object, delta chains in packs | Optional zstd or zlib per chunk (not per object) |
 
 ### Always Bare
 
@@ -106,14 +106,15 @@ The `depth` parameter on `clone_from` and `fetch` fetches limited history, but d
 
 When an object is replaced (via `INSERT OR REPLACE`), its old chunk mappings are deleted from `object_chunks`, but the chunks themselves remain in the `chunks` table if they were shared. Over time, chunks that are no longer referenced by any object can accumulate. There is no built-in cleanup mechanism yet.
 
-## Compression: On vs Off
+## Compression: Off vs zlib vs zstd
 
-| Aspect | Compression Off | Compression On |
-|---|---|---|
-| Database size | Larger | ~40-60% smaller for text-heavy repos |
-| SQL search | `LIKE` works on all chunks and inline blobs | `LIKE` works on inline blobs + uncompressed chunks; compressed chunks need Python decompression |
-| Write speed | Faster (no zlib overhead) | Slightly slower |
-| Read speed | Direct reads | Decompression needed for compressed chunks |
-| Mixed mode | N/A | Toggling compression doesn't break anything. Old chunks keep their compression, new chunks use the current setting |
+| Aspect | Off | zlib | zstd |
+|---|---|---|---|
+| Database size | Largest | ~40-60% smaller | ~55-65% smaller (with dictionary) |
+| SQL search | `LIKE` works on all data | Compressed chunks need Python decompression | Compressed chunks need Python decompression |
+| Write speed | Fastest | Slower | Faster than zlib |
+| Read speed | Direct reads | Decompression needed | Decompression needed (faster than zlib) |
+| Dictionary support | N/A | No | Yes — trained dictionaries improve ratios further |
+| Mixed mode | N/A | All methods coexist | All methods coexist |
 
-**Recommendation**: Enable compression for repositories where storage size matters and content search is infrequent. Leave it off for repositories where fast SQL queries on content are important.
+**Recommendation**: Use `compress=True` (zstd) for most repositories. It provides the best compression ratios with fast performance. Leave compression off only when fast SQL `LIKE` queries on chunk content are critical.

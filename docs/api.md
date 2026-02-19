@@ -10,7 +10,7 @@
 SqliteRepo(db_path: str)
 ```
 
-Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3/v4 databases to the current schema (v5).
+Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3 through v6 databases to the current schema (v7).
 
 **Raises:** `NotGitRepository` if the file is not a valid dulwich-sqlite database or has an unsupported schema version.
 
@@ -20,7 +20,7 @@ Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the s
 
 ```python
 @classmethod
-SqliteRepo.init_bare(db_path: str, *, compress: bool = False) -> SqliteRepo
+SqliteRepo.init_bare(db_path: str, *, compress: bool | str = False) -> SqliteRepo
 ```
 
 Creates a new bare repository in a SQLite file. Initializes the schema, sets up default metadata, and returns an open `SqliteRepo`.
@@ -28,7 +28,7 @@ Creates a new bare repository in a SQLite file. Initializes the schema, sets up 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `db_path` | `str` | required | Path for the new SQLite database file |
-| `compress` | `bool` | `False` | Enable zlib compression for chunk data |
+| `compress` | `bool \| str` | `False` | Enable compression. `True` uses zstd. Pass `"zlib"` or `"zstd"` to choose explicitly |
 
 #### `clone_from`
 
@@ -39,21 +39,21 @@ SqliteRepo.clone_from(
     db_path: str,
     *,
     origin: str = "origin",
-    compress: bool = False,
+    compress: bool | str = False,
     depth: int | None = None,
     branch: str | bytes | None = None,
     errstream: BinaryIO | None = None,
 ) -> SqliteRepo
 ```
 
-Clones a remote repository into a new SQLite database. Sets up remote tracking config and fetches objects via `dulwich.porcelain.fetch`.
+Clones a remote repository into a new SQLite database. Sets up remote tracking config and fetches objects via `dulwich.porcelain.fetch`. When using zstd compression, a dictionary is automatically trained from the fetched data.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `source` | `str` | required | URL or local path of the source repository |
 | `db_path` | `str` | required | Path for the new SQLite database file |
 | `origin` | `str` | `"origin"` | Name for the remote |
-| `compress` | `bool` | `False` | Enable zlib compression |
+| `compress` | `bool \| str` | `False` | Enable compression. `True` uses zstd. Pass `"zlib"` or `"zstd"` explicitly |
 | `depth` | `int \| None` | `None` | Shallow clone depth (number of commits) |
 | `branch` | `str \| bytes \| None` | `None` | Branch to set as HEAD (default: remote HEAD) |
 | `errstream` | `BinaryIO \| None` | `None` | Stream for progress output |
@@ -120,7 +120,19 @@ repo.enable_compression(method: str = "zlib") -> None
 repo.disable_compression() -> None
 ```
 
-Toggle compression for future chunk writes. Only `"zlib"` is currently supported. Existing chunks are not modified.
+Toggle compression for future chunk writes. Supported methods: `"zlib"` and `"zstd"`. Existing chunks are not modified.
+
+#### `train_dictionary`
+
+```python
+repo.train_dictionary(dict_size: int = 32768) -> None
+```
+
+Trains a zstd compression dictionary from existing chunk and inline object data. Stores the dictionary in `named_files` and loads it into the object store for immediate use. Called automatically by `clone_from()` when using zstd compression. Can also be called manually after adding data to improve compression ratios.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `dict_size` | `int` | `32768` | Size of the trained dictionary in bytes |
 
 #### `read_reflog`
 
@@ -216,7 +228,7 @@ Returns the parsed Dulwich object. Inherited from `BaseObjectStore` — calls `g
 store.get_raw(name: RawObjectID | ObjectID) -> tuple[int, bytes]
 ```
 
-Returns `(type_num, raw_data)`. For chunked objects, reassembles the data from chunks (decompressing any zlib-compressed chunks).
+Returns `(type_num, raw_data)`. For chunked objects, reassembles the data from chunks (decompressing any zlib or zstd compressed chunks).
 
 | `type_num` | Object Type |
 |---|---|

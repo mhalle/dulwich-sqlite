@@ -275,7 +275,7 @@ class TestCloneFrom:
         cloned.close()
 
     def test_clone_with_compression(self, tmp_path):
-        """Clone with zlib compression enabled."""
+        """Clone with compression enabled (compress=True now uses zstd)."""
         git_path = str(tmp_path / "source.git")
         source = _init_git_bare(git_path)
         commit_id = _make_commit(source, b"compress me")
@@ -286,7 +286,7 @@ class TestCloneFrom:
         cloned = SqliteRepo.clone_from(git_path, db_path, compress=True)
 
         assert commit_id in cloned.object_store
-        assert cloned.object_store._compression == "zlib"
+        assert cloned.object_store._compression == "zstd"
         cloned.close()
 
     def test_clone_with_custom_origin_name(self, tmp_path):

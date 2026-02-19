@@ -78,38 +78,40 @@ LIMIT 5;
 
 ### Reassembling Chunked Blobs
 
-Chunked blobs have `data IS NULL`. Reassemble by joining with the chunk tables:
+Chunked blobs have `data IS NULL`. Reassemble by joining with the chunk tables through integer rowid references:
 
 ```sql
 SELECT c.data, c.compression
 FROM object_chunks oc
-JOIN chunks c ON oc.chunk_sha = c.chunk_sha
-WHERE oc.object_sha = 'abc123...'
+JOIN chunks c ON c.rowid = oc.chunk_id
+WHERE oc.object_id = (SELECT rowid FROM objects WHERE sha = 'abc123...')
 ORDER BY oc.chunk_index;
 ```
 
-Each row is one chunk in order. Concatenate all chunk data to get the full blob content. If `compression` is `'zlib'`, decompress each chunk first.
+Each row is one chunk in order. Concatenate all chunk data to get the full blob content. If `compression` is `'zlib'` or `'zstd'`, decompress each chunk first.
 
 For uncompressed chunks, you can reassemble directly in SQL:
 
 ```sql
 SELECT GROUP_CONCAT(CAST(c.data AS TEXT), '') as full_content
 FROM object_chunks oc
-JOIN chunks c ON oc.chunk_sha = c.chunk_sha
-WHERE oc.object_sha = 'abc123...'
+JOIN chunks c ON c.rowid = oc.chunk_id
+WHERE oc.object_id = (SELECT rowid FROM objects WHERE sha = 'abc123...')
   AND c.compression = 'none'
 ORDER BY oc.chunk_index;
 ```
+
+**Note:** Since schema v7, `object_chunks` uses integer rowid references (`object_id`, `chunk_id`) instead of text SHA columns. To resolve SHAs, join through the `objects` and `chunks` tables.
 
 ## Chunk Queries
 
 ### Chunks for a Specific Object
 
 ```sql
-SELECT oc.chunk_index, oc.chunk_sha, c.stored_size, c.compression
+SELECT oc.chunk_index, c.chunk_sha, c.stored_size, c.compression
 FROM object_chunks oc
-JOIN chunks c ON oc.chunk_sha = c.chunk_sha
-WHERE oc.object_sha = 'abc123...'
+JOIN chunks c ON c.rowid = oc.chunk_id
+WHERE oc.object_id = (SELECT rowid FROM objects WHERE sha = 'abc123...')
 ORDER BY oc.chunk_index;
 ```
 
@@ -118,17 +120,19 @@ ORDER BY oc.chunk_index;
 Find all objects that share a specific chunk (demonstrates deduplication):
 
 ```sql
-SELECT oc.object_sha
+SELECT o.sha
 FROM object_chunks oc
-WHERE oc.chunk_sha = 'def456...';
+JOIN objects o ON o.rowid = oc.object_id
+WHERE oc.chunk_id = (SELECT rowid FROM chunks WHERE chunk_sha = 'def456...');
 ```
 
 ### Most Shared Chunks
 
 ```sql
-SELECT chunk_sha, COUNT(*) as shared_by
-FROM object_chunks
-GROUP BY chunk_sha
+SELECT c.chunk_sha, COUNT(*) as shared_by
+FROM object_chunks oc
+JOIN chunks c ON c.rowid = oc.chunk_id
+GROUP BY oc.chunk_id
 HAVING shared_by > 1
 ORDER BY shared_by DESC
 LIMIT 10;
@@ -141,8 +145,8 @@ Compare total chunk references to unique chunks:
 ```sql
 SELECT
     COUNT(*) as total_chunk_references,
-    COUNT(DISTINCT chunk_sha) as unique_chunks,
-    COUNT(*) - COUNT(DISTINCT chunk_sha) as duplicates_avoided
+    COUNT(DISTINCT chunk_id) as unique_chunks,
+    COUNT(*) - COUNT(DISTINCT chunk_id) as duplicates_avoided
 FROM object_chunks;
 ```
 
@@ -176,9 +180,10 @@ WHERE type_name = 'blob'
 ### Search Uncompressed Chunks
 
 ```sql
-SELECT DISTINCT oc.object_sha
+SELECT DISTINCT o.sha
 FROM chunks c
-JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha
+JOIN object_chunks oc ON c.rowid = oc.chunk_id
+JOIN objects o ON o.rowid = oc.object_id
 WHERE c.compression = 'none'
   AND CAST(c.data AS TEXT) LIKE '%TODO%';
 ```
@@ -188,8 +193,9 @@ WHERE c.compression = 'none'
 This matches what `search_content()` does for the SQL portion:
 
 ```sql
-SELECT DISTINCT oc.object_sha FROM chunks c
-JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha
+SELECT DISTINCT o.sha FROM chunks c
+JOIN object_chunks oc ON c.rowid = oc.chunk_id
+JOIN objects o ON o.rowid = oc.object_id
 WHERE c.compression = 'none' AND CAST(c.data AS TEXT) LIKE '%search_term%'
 UNION
 SELECT sha FROM objects
@@ -199,7 +205,7 @@ WHERE NOT is_chunked AND type_name = 'blob'
 
 ### Compressed Chunks
 
-Compressed chunks (`compression = 'zlib'`) cannot be searched with SQL `LIKE`. You need Python-side decompression:
+Compressed chunks (`compression = 'zlib'` or `'zstd'`) cannot be searched with SQL `LIKE`. You need Python-side decompression:
 
 ```python
 import sqlite3, zlib
@@ -208,9 +214,10 @@ conn = sqlite3.connect("my-repo.db")
 query = b"search_term"
 
 for row in conn.execute(
-    "SELECT DISTINCT oc.object_sha, c.data "
+    "SELECT DISTINCT o.sha, c.data "
     "FROM chunks c "
-    "JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha "
+    "JOIN object_chunks oc ON c.rowid = oc.chunk_id "
+    "JOIN objects o ON o.rowid = oc.object_id "
     "WHERE c.compression = 'zlib'"
 ):
     if query in zlib.decompress(bytes(row[1])):

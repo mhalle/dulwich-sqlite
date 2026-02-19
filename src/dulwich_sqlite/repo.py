@@ -17,6 +17,7 @@ from ._schema import (
     migrate_v3_to_v4,
     migrate_v4_to_v5,
     migrate_v5_to_v6,
+    migrate_v6_to_v7,
 )
 from .object_store import SqliteObjectStore
 from .refs import SqliteRefsContainer
@@ -77,6 +78,9 @@ class SqliteRepo(BaseRepo):
         if version == "5":
             migrate_v5_to_v6(self._conn)
             version = "6"
+        if version == "6":
+            migrate_v6_to_v7(self._conn)
+            version = "7"
         if version != SCHEMA_VERSION:
             raise NotGitRepository(
                 f"Unsupported schema version {version} "
@@ -128,12 +132,14 @@ class SqliteRepo(BaseRepo):
             self._config = ConfigFile()
 
     @classmethod
-    def init_bare(cls, db_path: str, *, compress: bool = False) -> "SqliteRepo":
+    def init_bare(cls, db_path: str, *, compress: bool | str = False) -> "SqliteRepo":
         conn = sqlite3.connect(db_path)
         init_db(conn)
         if compress:
+            method = compress if isinstance(compress, str) else "zstd"
             conn.execute(
-                "UPDATE metadata SET value = 'zlib' WHERE key = 'compression'"
+                "UPDATE metadata SET value = ? WHERE key = 'compression'",
+                (method,),
             )
             conn.commit()
         conn.close()
@@ -142,7 +148,7 @@ class SqliteRepo(BaseRepo):
         return repo
 
     def enable_compression(self, method: str = "zlib") -> None:
-        if method not in ("zlib",):
+        if method not in ("zlib", "zstd"):
             raise ValueError(f"Unsupported compression method: {method}")
         self._conn.execute(
             "UPDATE metadata SET value = ? WHERE key = 'compression'",
@@ -221,7 +227,7 @@ class SqliteRepo(BaseRepo):
         db_path: str,
         *,
         origin: str = "origin",
-        compress: bool = False,
+        compress: bool | str = False,
         depth: int | None = None,
         branch: str | bytes | None = None,
         errstream: "BinaryIO | None" = None,
@@ -235,7 +241,8 @@ class SqliteRepo(BaseRepo):
             source: URL or local path of the source repository.
             db_path: Path for the new SQLite database file.
             origin: Name for the remote (default ``"origin"``).
-            compress: Enable zlib compression for stored objects.
+            compress: Enable compression. ``True`` uses zstd, or pass
+                ``"zlib"``/``"zstd"`` explicitly.
             depth: Create a shallow clone with this many commits.
             branch: Branch to checkout as HEAD (default: remote HEAD).
             errstream: Optional stream for progress output.
@@ -290,6 +297,10 @@ class SqliteRepo(BaseRepo):
             if target_ref is not None and target_ref in result.refs:
                 repo.refs[target_ref] = result.refs[target_ref]
                 repo.refs.set_symbolic_ref(b"HEAD", target_ref)
+
+            # Train zstd dictionary from the freshly fetched data
+            if repo.object_store._compression == "zstd":
+                repo.train_dictionary()
         except BaseException:
             repo.close()
             raise
@@ -347,6 +358,35 @@ class SqliteRepo(BaseRepo):
         if errstream is not None:
             kwargs["errstream"] = errstream
         porcelain.push(self, remote_location, **kwargs)
+
+    def train_dictionary(self, dict_size: int = 32768) -> None:
+        """Train a zstd compression dictionary from existing chunk data.
+
+        Stores the trained dictionary in named_files at path ``_zstd_dict``
+        and loads it into the object store for immediate use.
+
+        Args:
+            dict_size: Size of the trained dictionary in bytes (default 32 KB).
+        """
+        import zstandard
+
+        samples = []
+        for row in self._conn.execute(
+            "SELECT data, compression FROM chunks LIMIT 10000"
+        ):
+            raw = self.object_store._decompress(bytes(row[0]), row[1])
+            samples.append(raw)
+        for row in self._conn.execute(
+            "SELECT data FROM objects WHERE data IS NOT NULL LIMIT 5000"
+        ):
+            samples.append(bytes(row[0]))
+        if len(samples) < 10:
+            return
+        dict_data = zstandard.train_dictionary(dict_size, samples)
+        self._put_named_file("_zstd_dict", dict_data.as_bytes())
+        self.object_store._zstd_dict = zstandard.ZstdCompressionDict(
+            dict_data.as_bytes()
+        )
 
     def close(self) -> None:
         self.object_store.close()

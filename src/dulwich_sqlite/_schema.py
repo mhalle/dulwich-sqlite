@@ -2,7 +2,7 @@
 
 import sqlite3
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -41,13 +41,13 @@ CREATE_TABLES = [
     """,
     """
     CREATE TABLE IF NOT EXISTS object_chunks (
-        object_sha TEXT NOT NULL,
+        object_id INTEGER NOT NULL,
         chunk_index INTEGER NOT NULL,
-        chunk_sha TEXT NOT NULL,
-        PRIMARY KEY (object_sha, chunk_index)
+        chunk_id INTEGER NOT NULL,
+        PRIMARY KEY (object_id, chunk_index)
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_object_chunks_chunk ON object_chunks (chunk_sha)",
+    "CREATE INDEX IF NOT EXISTS idx_object_chunks_chunk ON object_chunks (chunk_id)",
     """
     CREATE TABLE IF NOT EXISTS refs (
         name BLOB PRIMARY KEY NOT NULL,
@@ -237,5 +237,42 @@ def migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "UPDATE metadata SET value = '6' WHERE key = 'schema_version'",
+    )
+    conn.commit()
+
+
+def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    """Migrate a v6 database to v7 schema.
+
+    Replaces text SHA columns in object_chunks with integer rowid references
+    to the objects and chunks tables.
+    """
+    conn.execute(
+        """
+        CREATE TABLE object_chunks_new (
+            object_id INTEGER NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_id INTEGER NOT NULL,
+            PRIMARY KEY (object_id, chunk_index)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO object_chunks_new (object_id, chunk_index, chunk_id)
+        SELECT o.rowid, oc.chunk_index, c.rowid
+        FROM object_chunks oc
+        JOIN objects o ON o.sha = oc.object_sha
+        JOIN chunks c ON c.chunk_sha = oc.chunk_sha
+        """
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_object_chunks_chunk")
+    conn.execute("DROP TABLE object_chunks")
+    conn.execute("ALTER TABLE object_chunks_new RENAME TO object_chunks")
+    conn.execute(
+        "CREATE INDEX idx_object_chunks_chunk ON object_chunks (chunk_id)"
+    )
+    conn.execute(
+        "UPDATE metadata SET value = '7' WHERE key = 'schema_version'",
     )
     conn.commit()

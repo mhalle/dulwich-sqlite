@@ -4,7 +4,7 @@ dulwich-sqlite stores all repository data in a single SQLite database. This docu
 
 ## Schema Version
 
-The current schema version is **6**. The version is stored in the `metadata` table under the key `schema_version`.
+The current schema version is **7**. The version is stored in the `metadata` table under the key `schema_version`.
 
 ### Version History
 
@@ -14,8 +14,9 @@ The current schema version is **6**. The version is stored in the `metadata` tab
 | v4 | Added chunking: new `chunks` and `object_chunks` tables. `objects.data` made nullable, `total_size` column added. Recreated `objects` table with generated columns (`type_name`, `size_bytes`) |
 | v5 | Added compression: `compression` column on `chunks` table. `compression` key added to `metadata` |
 | v6 | Added convenience generated columns: `objects.is_chunked`, `chunks.stored_size`, `reflog.old_sha_text`, `reflog.new_sha_text`, `reflog.committer_text`, `reflog.datetime_text` |
+| v7 | Integer keys in `object_chunks`: replaced `object_sha`/`chunk_sha` text columns with `object_id`/`chunk_id` integer rowid references. Added zstd compression support |
 
-Migration from v3, v4, or v5 happens automatically when opening a database with `SqliteRepo()`.
+Migration from v3 through v6 happens automatically when opening a database with `SqliteRepo()`.
 
 ## Pragmas
 
@@ -93,38 +94,40 @@ CREATE TABLE chunks (
 |---|---|---|
 | `chunk_sha` | TEXT PK | SHA-256 hex digest of the **raw** (uncompressed) chunk data |
 | `data` | BLOB | Chunk data, possibly compressed |
-| `compression` | TEXT | Compression method: `'none'` or `'zlib'` |
+| `compression` | TEXT | Compression method: `'none'`, `'zlib'`, or `'zstd'` |
 | `stored_size` | INTEGER (generated) | On-disk size of the stored data in bytes (may differ from raw size if compressed) |
 
 **Notes:**
 - The SHA-256 key is always computed on raw data, regardless of whether the stored data is compressed. This ensures deduplication works across compression modes
 - Chunks are inserted with `INSERT OR IGNORE`, so if two objects share the same chunk, only the first copy is stored
-- A single database can have a mix of `'none'` and `'zlib'` chunks
+- A single database can have a mix of `'none'`, `'zlib'`, and `'zstd'` chunks
 
 ### `object_chunks`
 
-Maps objects to their ordered sequence of chunks.
+Maps objects to their ordered sequence of chunks via integer rowid references.
 
 ```sql
 CREATE TABLE object_chunks (
-    object_sha TEXT NOT NULL,
+    object_id INTEGER NOT NULL,
     chunk_index INTEGER NOT NULL,
-    chunk_sha TEXT NOT NULL,
-    PRIMARY KEY (object_sha, chunk_index)
+    chunk_id INTEGER NOT NULL,
+    PRIMARY KEY (object_id, chunk_index)
 );
 
-CREATE INDEX idx_object_chunks_chunk ON object_chunks (chunk_sha);
+CREATE INDEX idx_object_chunks_chunk ON object_chunks (chunk_id);
 ```
 
 | Column | Type | Description |
 |---|---|---|
-| `object_sha` | TEXT | Hex SHA-1 of the Git object (FK to `objects.sha`) |
+| `object_id` | INTEGER | rowid of the Git object in the `objects` table |
 | `chunk_index` | INTEGER | 0-based position of this chunk in the object's data |
-| `chunk_sha` | TEXT | SHA-256 of the chunk (FK to `chunks.chunk_sha`) |
+| `chunk_id` | INTEGER | rowid of the chunk in the `chunks` table |
 
 **Notes:**
-- To reassemble a chunked object, query `object_chunks` ordered by `chunk_index` and concatenate the referenced chunk data
-- The index on `chunk_sha` supports reverse lookups (finding all objects that share a chunk)
+- To reassemble a chunked object, join `object_chunks` with `chunks` on `chunk_id = chunks.rowid`, ordered by `chunk_index`, and concatenate the chunk data
+- To resolve the object SHA, join with `objects` on `object_id = objects.rowid`
+- The index on `chunk_id` supports reverse lookups (finding all objects that share a chunk)
+- Integer keys reduce storage overhead significantly compared to the text SHA columns used in schema v6 and earlier
 
 ### `refs`
 
@@ -201,8 +204,8 @@ CREATE TABLE metadata (
 
 | Key | Values | Description |
 |---|---|---|
-| `schema_version` | `"3"`, `"4"`, `"5"`, `"6"` | Current schema version |
-| `compression` | `"none"`, `"zlib"` | Current compression setting for new chunks |
+| `schema_version` | `"3"` through `"7"` | Current schema version |
+| `compression` | `"none"`, `"zlib"`, `"zstd"` | Current compression setting for new chunks |
 
 ### `reflog`
 
@@ -287,3 +290,15 @@ Added convenience generated columns via `ALTER TABLE ADD COLUMN`:
 7. Schema version updated to `"6"`
 
 All columns are VIRTUAL (computed on read, no storage overhead).
+
+### v6 to v7
+
+Replaced text SHA columns in `object_chunks` with integer rowid references:
+
+1. New `object_chunks_new` table created with `(object_id INTEGER, chunk_index INTEGER, chunk_id INTEGER)` schema
+2. Data migrated via `INSERT INTO object_chunks_new SELECT o.rowid, oc.chunk_index, c.rowid FROM object_chunks oc JOIN objects o ON o.sha = oc.object_sha JOIN chunks c ON c.chunk_sha = oc.chunk_sha`
+3. Old index and table dropped, new table renamed to `object_chunks`
+4. New index created on `chunk_id`
+5. Schema version updated to `"7"`
+
+This migration significantly reduces `object_chunks` storage overhead by replacing 40+ byte text SHA columns with ~3 byte integer rowid references.

@@ -19,6 +19,7 @@ uv pip install dulwich-sqlite
 - Python 3.12+
 - [dulwich](https://www.dulwich.io/) >= 1.0.0 (pure-Python Git implementation)
 - [fastcdc](https://pypi.org/project/fastcdc/) >= 1.5.0 (content-defined chunking for binary blobs)
+- [zstandard](https://pypi.org/project/zstandard/) >= 0.19.0 (zstd compression)
 - SQLite 3 (included in the Python standard library)
 
 ## Creating a Repository
@@ -33,10 +34,17 @@ repo = SqliteRepo.init_bare("my-repo.db")
 
 This creates a new SQLite database at the given path, initializes the schema, and returns an open `SqliteRepo` instance.
 
-To enable zlib compression for stored chunks:
+To enable zstd compression for stored chunks (the default when `compress=True`):
 
 ```python
 repo = SqliteRepo.init_bare("my-repo.db", compress=True)
+```
+
+Or choose a specific compression method:
+
+```python
+repo = SqliteRepo.init_bare("my-repo.db", compress="zlib")  # zlib compression
+repo = SqliteRepo.init_bare("my-repo.db", compress="zstd")  # zstd compression
 ```
 
 ## Storing Objects
@@ -252,17 +260,27 @@ repo.close()
 
 ## Compression
 
-dulwich-sqlite can optionally compress chunk data with zlib.
+dulwich-sqlite can optionally compress chunk data with zstd (default) or zlib.
 
 ### Enable Compression
 
 ```python
-# At creation time
+# At creation time (uses zstd by default)
 repo = SqliteRepo.init_bare("my-repo.db", compress=True)
 
 # Or on an existing repo
-repo.enable_compression()
+repo.enable_compression("zstd")  # or "zlib"
 ```
+
+### Dictionary Training (zstd)
+
+zstd compression benefits from trained dictionaries. After populating a repository, train a dictionary to improve compression:
+
+```python
+repo.train_dictionary()
+```
+
+This is called automatically by `clone_from()` when using zstd compression.
 
 ### Disable Compression
 
@@ -274,15 +292,16 @@ repo.disable_compression()
 
 - Compression applies to **new chunks** written after it's enabled
 - Existing chunks are **not** re-compressed or decompressed
-- A single database can contain both compressed and uncompressed chunks (mixed mode)
+- A single database can contain chunks with different compression methods (mixed mode)
 - Only chunked blobs (>4 KB) are affected; inline blobs and non-blob objects are stored as-is
 - Chunk SHA-256 hashes are computed on the **raw** data, so deduplication works correctly across compression modes
 
 ### Trade-offs
 
-| | Compression Off | Compression On |
-|---|---|---|
-| Database size | Larger | ~40-60% smaller for text |
-| SQL search (`LIKE`) | Works directly on all data | Only works on uncompressed chunks; compressed chunks require Python-side decompression |
-| Write speed | Faster | Slightly slower (zlib overhead) |
-| Read speed | Direct | Decompression on read for compressed chunks |
+| | Compression Off | zlib | zstd |
+|---|---|---|---|
+| Database size | Largest | ~40-60% smaller | ~55-65% smaller |
+| SQL search (`LIKE`) | Works directly | Compressed chunks need Python decompression | Compressed chunks need Python decompression |
+| Write speed | Fastest | Slower | Faster than zlib |
+| Read speed | Direct | Decompression needed | Decompression needed (faster than zlib) |
+| Dictionary support | N/A | No | Yes — trained dictionaries improve ratios |

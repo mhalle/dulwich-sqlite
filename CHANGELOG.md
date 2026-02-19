@@ -2,6 +2,25 @@
 
 All notable changes to dulwich-sqlite are documented in this file.
 
+## [0.3.0] — 2026-02-19
+
+### Added
+
+- **zstd compression**: New default compression method when `compress=True`. Faster and better ratios than zlib
+  - `zstandard` added as a required dependency
+  - Dictionary training via `train_dictionary()` for improved compression of small chunks
+  - `clone_from()` automatically trains a zstd dictionary after fetching
+  - `enable_compression("zstd")` to switch an existing repo to zstd
+  - Mixed mode: `none`, `zlib`, and `zstd` chunks coexist in the same database
+
+### Changed
+
+- **Schema v7**: `object_chunks` table now uses integer rowid references (`object_id`, `chunk_id`) instead of text SHA columns (`object_sha`, `chunk_sha`). Reduces storage overhead significantly
+  - Automatic migration from v6 on open
+  - Direct SQL queries on `object_chunks` now need JOINs through `objects`/`chunks` tables to resolve SHAs
+- `compress=True` on `init_bare()` and `clone_from()` now defaults to zstd (was zlib). Use `compress="zlib"` for the old behavior
+- `compress` parameter type changed from `bool` to `bool | str`
+
 ## [0.2.0] — 2026-02-19
 
 ### Added

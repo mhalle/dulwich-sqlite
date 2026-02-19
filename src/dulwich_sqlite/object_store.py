@@ -33,6 +33,14 @@ class SqliteObjectStore(PackCapableObjectStore):
             "SELECT value FROM metadata WHERE key = 'compression'"
         ).fetchone()
         self._compression: str = row[0] if row is not None else "none"
+        self._zstd_dict = None
+        dict_row = conn.execute(
+            "SELECT contents FROM named_files WHERE path = '_zstd_dict'"
+        ).fetchone()
+        if dict_row is not None:
+            import zstandard
+
+            self._zstd_dict = zstandard.ZstdCompressionDict(bytes(dict_row[0]))
 
     def _to_hexsha(self, sha: ObjectID | RawObjectID) -> ObjectID:
         if len(sha) == self.object_format.hex_length:
@@ -42,11 +50,34 @@ class SqliteObjectStore(PackCapableObjectStore):
         else:
             raise ValueError(f"Invalid sha {sha!r}")
 
+    def _compress(self, data: bytes) -> bytes:
+        if self._compression == "none":
+            return data
+        if self._compression == "zlib":
+            return zlib.compress(data)
+        if self._compression == "zstd":
+            import zstandard
+
+            kwargs = {}
+            if self._zstd_dict is not None:
+                kwargs["dict_data"] = self._zstd_dict
+            cctx = zstandard.ZstdCompressor(level=3, **kwargs)
+            return cctx.compress(data)
+        raise ValueError(f"Unknown compression method: {self._compression}")
+
     def _decompress(self, data: bytes, method: str) -> bytes:
         if method == "none":
             return data
         if method == "zlib":
             return zlib.decompress(data)
+        if method == "zstd":
+            import zstandard
+
+            kwargs = {}
+            if self._zstd_dict is not None:
+                kwargs["dict_data"] = self._zstd_dict
+            dctx = zstandard.ZstdDecompressor(**kwargs)
+            return dctx.decompress(data)
         raise ValueError(f"Unknown compression method: {method}")
 
     def contains_loose(self, sha: ObjectID | RawObjectID) -> bool:
@@ -82,21 +113,20 @@ class SqliteObjectStore(PackCapableObjectStore):
     def get_raw(self, name: RawObjectID | ObjectID) -> tuple[int, bytes]:
         hexsha = self._to_hexsha(name)
         row = self._conn.execute(
-            "SELECT type_num, data FROM objects WHERE sha = ?",
+            "SELECT rowid, type_num, data FROM objects WHERE sha = ?",
             (hexsha.decode("ascii"),),
         ).fetchone()
         if row is None:
             raise KeyError(hexsha)
-        type_num, data = row
+        obj_rowid, type_num, data = row
         if data is not None:
             return type_num, bytes(data)
         # Reassemble from chunks
-        sha_str = hexsha.decode("ascii")
         chunk_rows = self._conn.execute(
             "SELECT c.data, c.compression FROM object_chunks oc "
-            "JOIN chunks c ON oc.chunk_sha = c.chunk_sha "
-            "WHERE oc.object_sha = ? ORDER BY oc.chunk_index",
-            (sha_str,),
+            "JOIN chunks c ON c.rowid = oc.chunk_id "
+            "WHERE oc.object_id = ? ORDER BY oc.chunk_index",
+            (obj_rowid,),
         ).fetchall()
         parts = []
         for data, compression in chunk_rows:
@@ -113,30 +143,36 @@ class SqliteObjectStore(PackCapableObjectStore):
             chunks = chunk_blob(raw_data)
 
         if chunks is not None:
-            # Chunked storage: clear any existing chunks for REPLACE semantics
-            self._conn.execute(
-                "DELETE FROM object_chunks WHERE object_sha = ?",
-                (sha_str,),
-            )
+            # Insert or replace the object row first
             self._conn.execute(
                 "INSERT OR REPLACE INTO objects (sha, type_num, data, total_size) "
                 "VALUES (?, ?, NULL, ?)",
                 (sha_str, obj.type_num, len(raw_data)),
             )
+            obj_rowid = self._conn.execute(
+                "SELECT rowid FROM objects WHERE sha = ?",
+                (sha_str,),
+            ).fetchone()[0]
+            # Clear any existing chunk mappings for REPLACE semantics
+            self._conn.execute(
+                "DELETE FROM object_chunks WHERE object_id = ?",
+                (obj_rowid,),
+            )
             for idx, (chunk_sha, chunk_data) in enumerate(chunks):
-                if self._compression == "zlib":
-                    stored_data = zlib.compress(chunk_data)
-                else:
-                    stored_data = chunk_data
+                stored_data = self._compress(chunk_data)
                 self._conn.execute(
                     "INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) "
                     "VALUES (?, ?, ?)",
                     (chunk_sha, stored_data, self._compression),
                 )
+                chunk_rowid = self._conn.execute(
+                    "SELECT rowid FROM chunks WHERE chunk_sha = ?",
+                    (chunk_sha,),
+                ).fetchone()[0]
                 self._conn.execute(
-                    "INSERT INTO object_chunks (object_sha, chunk_index, chunk_sha) "
+                    "INSERT INTO object_chunks (object_id, chunk_index, chunk_id) "
                     "VALUES (?, ?, ?)",
-                    (sha_str, idx, chunk_sha),
+                    (obj_rowid, idx, chunk_rowid),
                 )
         else:
             # Inline storage
@@ -241,8 +277,9 @@ class SqliteObjectStore(PackCapableObjectStore):
 
         # 1. SQL LIKE on uncompressed chunks + inline objects
         sql = """
-            SELECT DISTINCT oc.object_sha FROM chunks c
-            JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha
+            SELECT DISTINCT o.sha FROM chunks c
+            JOIN object_chunks oc ON c.rowid = oc.chunk_id
+            JOIN objects o ON o.rowid = oc.object_id
             WHERE c.compression = 'none' AND CAST(c.data AS TEXT) LIKE ?
             UNION
             SELECT sha FROM objects
@@ -255,8 +292,9 @@ class SqliteObjectStore(PackCapableObjectStore):
         # 2. Python-side search on compressed chunks
         query_bytes = query.encode("utf-8", errors="surrogateescape")
         for row in self._conn.execute(
-            "SELECT DISTINCT oc.object_sha, c.data, c.compression FROM chunks c "
-            "JOIN object_chunks oc ON c.chunk_sha = oc.chunk_sha "
+            "SELECT DISTINCT o.sha, c.data, c.compression FROM chunks c "
+            "JOIN object_chunks oc ON c.rowid = oc.chunk_id "
+            "JOIN objects o ON o.rowid = oc.object_id "
             "WHERE c.compression != 'none'"
         ).fetchall():
             if row[0] not in results:

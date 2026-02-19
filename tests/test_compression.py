@@ -8,7 +8,7 @@ import pytest
 from dulwich.objects import Blob
 
 from dulwich_sqlite import SqliteRepo
-from dulwich_sqlite._schema import init_db, migrate_v4_to_v5
+from dulwich_sqlite._schema import init_db, migrate_v4_to_v5, migrate_v6_to_v7
 from dulwich_sqlite.object_store import SqliteObjectStore
 
 
@@ -32,7 +32,7 @@ def compressed_store(tmp_path):
 @pytest.fixture
 def repo(tmp_path):
     db = str(tmp_path / "comp.db")
-    r = SqliteRepo.init_bare(db, compress=True)
+    r = SqliteRepo.init_bare(db, compress="zlib")
     yield r
     r.close()
 
@@ -192,15 +192,23 @@ class TestToggle:
 
 
 class TestInitBare:
-    def test_init_bare_compress_true(self, tmp_path):
+    def test_init_bare_compress_true_uses_zstd(self, tmp_path):
         db = str(tmp_path / "bare_comp.db")
         repo = SqliteRepo.init_bare(db, compress=True)
         try:
-            assert repo.object_store._compression == "zlib"
+            assert repo.object_store._compression == "zstd"
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'compression'"
             ).fetchone()
-            assert row[0] == "zlib"
+            assert row[0] == "zstd"
+        finally:
+            repo.close()
+
+    def test_init_bare_compress_zlib(self, tmp_path):
+        db = str(tmp_path / "bare_zlib.db")
+        repo = SqliteRepo.init_bare(db, compress="zlib")
+        try:
+            assert repo.object_store._compression == "zlib"
         finally:
             repo.close()
 
@@ -357,13 +365,13 @@ class TestMigration:
         conn.commit()
         conn.close()
 
-        # Open with SqliteRepo — should trigger v4→v5→v6 migration
+        # Open with SqliteRepo — should trigger v4→v5→v6→v7 migration
         repo = SqliteRepo(db)
         try:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "6"
+            assert row[0] == "7"
 
             # compression metadata inserted
             row = repo._conn.execute(
@@ -382,5 +390,318 @@ class TestMigration:
             repo._conn.execute(
                 "SELECT compression FROM chunks LIMIT 1"
             )
+        finally:
+            repo.close()
+
+
+class TestZstdCompression:
+    def test_zstd_blob_roundtrip(self, tmp_path):
+        db = str(tmp_path / "zstd.db")
+        repo = SqliteRepo.init_bare(db, compress="zstd")
+        try:
+            data = _large_text("zstd_roundtrip")
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+            type_num, retrieved = repo.object_store.get_raw(blob.id)
+            assert type_num == blob.type_num
+            assert retrieved == data
+            # Verify chunks are stored with zstd compression
+            row = repo._conn.execute(
+                "SELECT compression FROM chunks LIMIT 1"
+            ).fetchone()
+            assert row[0] == "zstd"
+        finally:
+            repo.close()
+
+    def test_zstd_with_dictionary(self, tmp_path):
+        db = str(tmp_path / "zstd_dict.db")
+        repo = SqliteRepo.init_bare(db, compress="zstd")
+        try:
+            # Store several blobs to have enough samples
+            for i in range(20):
+                blob = Blob.from_string(_large_text(f"sample_{i}"))
+                repo.object_store.add_object(blob)
+
+            # Train dictionary
+            repo.train_dictionary()
+            assert repo.object_store._zstd_dict is not None
+
+            # Verify dict is stored
+            row = repo._conn.execute(
+                "SELECT contents FROM named_files WHERE path = '_zstd_dict'"
+            ).fetchone()
+            assert row is not None
+
+            # Store a new blob with dictionary and verify roundtrip
+            data = _large_text("after_dict_training")
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+            _, retrieved = repo.object_store.get_raw(blob.id)
+            assert retrieved == data
+        finally:
+            repo.close()
+
+    def test_zstd_search(self, tmp_path):
+        db = str(tmp_path / "zstd_search.db")
+        repo = SqliteRepo.init_bare(db, compress="zstd")
+        try:
+            data = _large_text("zstd_searchable_term")
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            results = repo.object_store.search_content("zstd_searchable_term")
+            assert blob.id in results
+        finally:
+            repo.close()
+
+    def test_mixed_zlib_zstd_readable(self, tmp_path):
+        db = str(tmp_path / "mixed_zstd.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            # Store uncompressed
+            data1 = _large_text("uncompressed_data")
+            blob1 = Blob.from_string(data1)
+            repo.object_store.add_object(blob1)
+
+            # Switch to zlib
+            repo.enable_compression("zlib")
+            data2 = _large_text("zlib_compressed")
+            blob2 = Blob.from_string(data2)
+            repo.object_store.add_object(blob2)
+
+            # Switch to zstd
+            repo.enable_compression("zstd")
+            data3 = _large_text("zstd_compressed")
+            blob3 = Blob.from_string(data3)
+            repo.object_store.add_object(blob3)
+
+            # All should be readable
+            _, r1 = repo.object_store.get_raw(blob1.id)
+            _, r2 = repo.object_store.get_raw(blob2.id)
+            _, r3 = repo.object_store.get_raw(blob3.id)
+            assert r1 == data1
+            assert r2 == data2
+            assert r3 == data3
+
+            # Verify mixed compression in DB
+            methods = set(
+                r[0]
+                for r in repo._conn.execute(
+                    "SELECT DISTINCT compression FROM chunks"
+                ).fetchall()
+            )
+            assert methods == {"none", "zlib", "zstd"}
+        finally:
+            repo.close()
+
+    def test_enable_zstd(self, tmp_path):
+        db = str(tmp_path / "enable_zstd.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            repo.enable_compression("zstd")
+            assert repo.object_store._compression == "zstd"
+
+            data = _large_text("zstd_enabled")
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            row = repo._conn.execute(
+                "SELECT compression FROM chunks LIMIT 1"
+            ).fetchone()
+            assert row[0] == "zstd"
+        finally:
+            repo.close()
+
+
+class TestIntegerKeys:
+    def test_object_chunks_uses_integer_keys(self, tmp_path):
+        db = str(tmp_path / "intkeys.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = _large_text("integer_keys_test")
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            # Verify object_chunks has integer columns
+            cols = [
+                r[1]
+                for r in repo._conn.execute(
+                    "PRAGMA table_info(object_chunks)"
+                ).fetchall()
+            ]
+            assert "object_id" in cols
+            assert "chunk_id" in cols
+            assert "object_sha" not in cols
+            assert "chunk_sha" not in cols
+
+            # Verify the integer values make sense
+            row = repo._conn.execute(
+                "SELECT object_id, chunk_id FROM object_chunks LIMIT 1"
+            ).fetchone()
+            assert isinstance(row[0], int)
+            assert isinstance(row[1], int)
+        finally:
+            repo.close()
+
+    def test_v6_to_v7_migration(self, tmp_path):
+        """Create a v6 DB with text object_chunks columns, open, verify migration."""
+        db = str(tmp_path / "v6.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Create v6-style schema
+        conn.execute(
+            """
+            CREATE TABLE objects (
+                sha TEXT PRIMARY KEY NOT NULL,
+                type_num INTEGER NOT NULL,
+                data BLOB,
+                total_size INTEGER,
+                type_name TEXT GENERATED ALWAYS AS (
+                    CASE type_num
+                        WHEN 1 THEN 'commit'
+                        WHEN 2 THEN 'tree'
+                        WHEN 3 THEN 'blob'
+                        WHEN 4 THEN 'tag'
+                    END
+                ) VIRTUAL,
+                size_bytes INTEGER GENERATED ALWAYS AS (
+                    CASE WHEN data IS NOT NULL THEN length(data) ELSE total_size END
+                ) VIRTUAL,
+                is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE chunks (
+                chunk_sha TEXT PRIMARY KEY NOT NULL,
+                data BLOB NOT NULL,
+                compression TEXT NOT NULL DEFAULT 'none',
+                stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE object_chunks (
+                object_sha TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_sha TEXT NOT NULL,
+                PRIMARY KEY (object_sha, chunk_index)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX idx_object_chunks_chunk ON object_chunks (chunk_sha)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE peeled_refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE named_files (path TEXT PRIMARY KEY NOT NULL, contents BLOB NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE reflog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ref_name BLOB NOT NULL,
+                old_sha BLOB NOT NULL,
+                new_sha BLOB NOT NULL,
+                committer BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                timezone INTEGER NOT NULL,
+                message BLOB NOT NULL,
+                ref_name_text TEXT GENERATED ALWAYS AS (cast(ref_name AS TEXT)) VIRTUAL,
+                old_sha_text TEXT GENERATED ALWAYS AS (cast(old_sha AS TEXT)) VIRTUAL,
+                new_sha_text TEXT GENERATED ALWAYS AS (cast(new_sha AS TEXT)) VIRTUAL,
+                committer_text TEXT GENERATED ALWAYS AS (cast(committer AS TEXT)) VIRTUAL,
+                message_text TEXT GENERATED ALWAYS AS (cast(message AS TEXT)) VIRTUAL,
+                datetime_text TEXT GENERATED ALWAYS AS (datetime(timestamp, 'unixepoch')) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reflog_ref ON reflog (ref_name, id)"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '6')"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('compression', 'none')"
+        )
+
+        # Insert a chunked object manually
+        obj_sha = "abcd" * 10
+        chunk_sha = "ef01" * 16
+        chunk_data = b"test chunk data that is stored"
+        conn.execute(
+            "INSERT INTO objects (sha, type_num, data, total_size) VALUES (?, 3, NULL, ?)",
+            (obj_sha, len(chunk_data)),
+        )
+        conn.execute(
+            "INSERT INTO chunks (chunk_sha, data, compression) VALUES (?, ?, 'none')",
+            (chunk_sha, chunk_data),
+        )
+        conn.execute(
+            "INSERT INTO object_chunks (object_sha, chunk_index, chunk_sha) VALUES (?, 0, ?)",
+            (obj_sha, chunk_sha),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteRepo — should trigger v6→v7 migration
+        repo = SqliteRepo(db)
+        try:
+            row = repo._conn.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            assert row[0] == "7"
+
+            # Verify integer columns
+            cols = [
+                r[1]
+                for r in repo._conn.execute(
+                    "PRAGMA table_info(object_chunks)"
+                ).fetchall()
+            ]
+            assert "object_id" in cols
+            assert "chunk_id" in cols
+
+            # Verify the data is still accessible through integer keys
+            row = repo._conn.execute(
+                "SELECT oc.object_id, oc.chunk_id FROM object_chunks oc LIMIT 1"
+            ).fetchone()
+            assert row is not None
+            assert isinstance(row[0], int)
+            assert isinstance(row[1], int)
+
+            # Verify data roundtrip through the new schema
+            type_num, data = repo.object_store.get_raw(obj_sha.encode("ascii"))
+            assert type_num == 3
+            assert data == chunk_data
         finally:
             repo.close()

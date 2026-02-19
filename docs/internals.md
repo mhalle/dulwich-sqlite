@@ -36,25 +36,27 @@ The full raw object data goes in the `data` column.
 
 For blobs >= 4096 bytes that produce multiple chunks:
 
-1. Clear any existing chunk mappings (for `REPLACE` semantics):
-   ```sql
-   DELETE FROM object_chunks WHERE object_sha = ?
-   ```
-
-2. Insert the object row with NULL data:
+1. Insert the object row with NULL data:
    ```sql
    INSERT OR REPLACE INTO objects (sha, type_num, data, total_size)
    VALUES (?, ?, NULL, ?)
    ```
 
-3. For each chunk, insert into the chunk store (dedup via `INSERT OR IGNORE`):
+2. Get the object's rowid and clear any existing chunk mappings (for `REPLACE` semantics):
    ```sql
-   INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) VALUES (?, ?, ?)
+   SELECT rowid FROM objects WHERE sha = ?
+   DELETE FROM object_chunks WHERE object_id = ?
    ```
 
-4. Record the chunk ordering:
+3. For each chunk, insert into the chunk store (dedup via `INSERT OR IGNORE`), then get its rowid:
    ```sql
-   INSERT INTO object_chunks (object_sha, chunk_index, chunk_sha) VALUES (?, ?, ?)
+   INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) VALUES (?, ?, ?)
+   SELECT rowid FROM chunks WHERE chunk_sha = ?
+   ```
+
+4. Record the chunk ordering with integer keys:
+   ```sql
+   INSERT INTO object_chunks (object_id, chunk_index, chunk_id) VALUES (?, ?, ?)
    ```
 
 ## Chunking Algorithms
@@ -130,16 +132,24 @@ The chunk SHA is always computed on the raw data, even when compression is enabl
 
 ### How It Works
 
-When compression is enabled (`compression = 'zlib'`), new chunks are compressed with `zlib.compress()` before storage:
+When compression is enabled, new chunks are compressed before storage using the configured method:
 
 ```python
-if self._compression == "zlib":
-    stored_data = zlib.compress(chunk_data)
-else:
-    stored_data = chunk_data
+stored_data = self._compress(chunk_data)
 ```
 
+The `_compress()` method dispatches based on the current compression setting:
+- `"none"`: no compression
+- `"zlib"`: standard zlib compression
+- `"zstd"`: zstandard compression (level 3), optionally with a trained dictionary
+
 The `compression` column in the `chunks` table records the method used for each chunk.
+
+### zstd Compression
+
+zstd (Zstandard) is the default compression method when `compress=True`. It offers better compression ratios and faster speed than zlib.
+
+**Dictionary training**: zstd supports trained dictionaries that improve compression for small, similar data. The `train_dictionary()` method samples existing chunks and inline objects, trains a 32 KB dictionary, and stores it in `named_files` at path `_zstd_dict`. The dictionary is loaded automatically when opening a repository. `clone_from()` trains a dictionary automatically after fetching when using zstd.
 
 ### On Read
 
@@ -152,10 +162,10 @@ for data, compression in chunk_rows:
 
 ### Mixed Mode
 
-A single database can contain both compressed and uncompressed chunks. This happens when:
+A single database can contain chunks with different compression methods (`'none'`, `'zlib'`, `'zstd'`). This happens when:
 
 - Compression is enabled after some objects were already stored
-- Compression is toggled off and then on again
+- Compression method is changed (e.g., from zlib to zstd)
 - A chunk was first stored uncompressed, then the same chunk is referenced by a new object stored with compression on — the existing uncompressed chunk is kept (INSERT OR IGNORE)
 
 Mixed mode is fully supported. Each chunk records its own compression method.
