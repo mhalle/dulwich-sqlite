@@ -19,14 +19,14 @@ def is_text(data: bytes) -> bool:
     return b"\x00" not in data[:8000]
 
 
-def _sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def _sha256_bin(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
 
 
-def chunk_text(data: bytes) -> list[tuple[str, bytes]]:
+def chunk_text(data: bytes) -> list[tuple[bytes, bytes]]:
     """Split text data into chunks at line boundaries using CRC32.
 
-    Returns list of (sha256_hex, chunk_data) tuples.
+    Returns list of (sha256_digest, chunk_data) tuples.
     """
     lines = data.split(b"\n")
     # Re-attach newlines to each line (except possibly the last if no trailing newline)
@@ -39,7 +39,7 @@ def chunk_text(data: bytes) -> list[tuple[str, bytes]]:
 
     if not parts:
         chunk_data = data
-        return [(_sha256_hex(chunk_data), chunk_data)]
+        return [(_sha256_bin(chunk_data), chunk_data)]
 
     chunks: list[tuple[str, bytes]] = []
     current_lines: list[bytes] = []
@@ -59,7 +59,7 @@ def chunk_text(data: bytes) -> list[tuple[str, bytes]]:
 
         if should_cut:
             chunk_data = b"".join(current_lines)
-            chunks.append((_sha256_hex(chunk_data), chunk_data))
+            chunks.append((_sha256_bin(chunk_data), chunk_data))
             current_lines = []
             current_bytes = 0
             line_count = 0
@@ -67,15 +67,15 @@ def chunk_text(data: bytes) -> list[tuple[str, bytes]]:
     # Flush remaining lines
     if current_lines:
         chunk_data = b"".join(current_lines)
-        chunks.append((_sha256_hex(chunk_data), chunk_data))
+        chunks.append((_sha256_bin(chunk_data), chunk_data))
 
     return chunks
 
 
-def chunk_binary(data: bytes) -> list[tuple[str, bytes]]:
+def chunk_binary(data: bytes) -> list[tuple[bytes, bytes]]:
     """Split binary data into chunks using FastCDC.
 
-    Returns list of (sha256_hex, chunk_data) tuples.
+    Returns list of (sha256_digest, chunk_data) tuples.
     """
     chunks: list[tuple[str, bytes]] = []
     for chunk in fastcdc(
@@ -85,15 +85,15 @@ def chunk_binary(data: bytes) -> list[tuple[str, bytes]]:
         max_size=BINARY_MAX_SIZE,
     ):
         chunk_data = data[chunk.offset : chunk.offset + chunk.length]
-        chunks.append((_sha256_hex(chunk_data), chunk_data))
+        chunks.append((_sha256_bin(chunk_data), chunk_data))
     return chunks
 
 
-def chunk_blob(data: bytes) -> list[tuple[str, bytes]] | None:
+def chunk_blob(data: bytes) -> list[tuple[bytes, bytes]] | None:
     """Chunk blob data for deduplication.
 
     Returns None if the blob should be stored inline (too small or only one chunk).
-    Otherwise returns list of (sha256_hex, chunk_data) tuples.
+    Otherwise returns list of (sha256_digest, chunk_data) tuples.
     """
     if len(data) < CHUNKING_THRESHOLD:
         return None

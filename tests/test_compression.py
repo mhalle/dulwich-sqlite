@@ -8,8 +8,8 @@ import pytest
 from dulwich.objects import Blob
 
 from dulwich_sqlite import SqliteRepo
-from dulwich_sqlite._schema import init_db, migrate_v4_to_v5, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9
-from dulwich_sqlite.object_store import SqliteObjectStore
+from dulwich_sqlite._schema import init_db, migrate_v4_to_v5, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9, migrate_v9_to_v10
+from dulwich_sqlite.object_store import SqliteObjectStore, unpack_chunk_refs
 
 
 def _large_text(keyword: str = "hello", n: int = 500) -> bytes:
@@ -69,9 +69,10 @@ class TestCompressedRoundtrip:
         data = b"small content"
         blob = Blob.from_string(data)
         compressed_store.add_object(blob)
+        sha_bin = bytes.fromhex(blob.id.decode("ascii"))
         row = compressed_store._conn.execute(
             "SELECT data, compression FROM objects WHERE sha = ?",
-            (blob.id.decode("ascii"),),
+            (sha_bin,),
         ).fetchone()
         # Small blobs are stored inline (data is not NULL)
         assert row[0] is not None
@@ -106,8 +107,8 @@ class TestChunksInDB:
         ).fetchall()
         for chunk_sha, stored_data, compression in rows:
             raw = zlib.decompress(bytes(stored_data))
-            expected_sha = hashlib.sha256(raw).hexdigest()
-            assert chunk_sha == expected_sha
+            expected_sha = hashlib.sha256(raw).digest()
+            assert bytes(chunk_sha) == expected_sha
 
 
 class TestDedup:
@@ -369,13 +370,13 @@ class TestMigration:
         conn.commit()
         conn.close()
 
-        # Open with SqliteRepo — should trigger v4→v5→...→v9 migration
+        # Open with SqliteRepo — should trigger v4→v5→...→v10 migration
         repo = SqliteRepo(db)
         try:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "9"
+            assert row[0] == "10"
 
             # compression metadata inserted
             row = repo._conn.execute(
@@ -383,10 +384,11 @@ class TestMigration:
             ).fetchone()
             assert row[0] == "none"
 
-            # Existing data still accessible
+            # Existing data still accessible via binary SHA
+            sha_bin = bytes.fromhex("abcd" * 10)
             row = repo._conn.execute(
                 "SELECT data FROM objects WHERE sha = ?",
-                ("abcd" * 10,),
+                (sha_bin,),
             ).fetchone()
             assert bytes(row[0]) == b"test data"
 
@@ -519,7 +521,6 @@ class TestZstdCompression:
 
 class TestChunkRefs:
     def test_chunk_refs_packed_correctly(self, tmp_path):
-        import struct
         db = str(tmp_path / "chunkrefs.db")
         repo = SqliteRepo.init_bare(db)
         try:
@@ -535,17 +536,16 @@ class TestChunkRefs:
             ]
             assert "object_chunks" not in tables
 
-            # Verify chunk_refs is a packed blob of 8-byte rowids
+            # Verify chunk_refs is a delta-varint packed blob
+            sha_bin = bytes.fromhex(blob.id.decode("ascii"))
             row = repo._conn.execute(
                 "SELECT chunk_refs FROM objects WHERE sha = ?",
-                (blob.id.decode("ascii"),),
+                (sha_bin,),
             ).fetchone()
             assert row[0] is not None
             refs_blob = bytes(row[0])
-            assert len(refs_blob) % 8 == 0
-            n = len(refs_blob) // 8
-            assert n > 0
-            rowids = struct.unpack(f'<{n}Q', refs_blob)
+            rowids = unpack_chunk_refs(refs_blob)
+            assert len(rowids) > 0
             # All rowids should be positive integers
             for rid in rowids:
                 assert isinstance(rid, int)
@@ -683,13 +683,13 @@ class TestChunkRefs:
         conn.commit()
         conn.close()
 
-        # Open with SqliteRepo — should trigger v6→v7→v8→v9 migration
+        # Open with SqliteRepo — should trigger v6→v7→v8→v9→v10 migration
         repo = SqliteRepo(db)
         try:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "9"
+            assert row[0] == "10"
 
             # Verify object_chunks table is gone
             tables = [
@@ -699,13 +699,15 @@ class TestChunkRefs:
             ]
             assert "object_chunks" not in tables
 
-            # Verify chunk_refs is populated for the chunked object
+            # Verify chunk_refs is populated for the chunked object (now binary SHA)
+            obj_sha_bin = bytes.fromhex(obj_sha)
             row = repo._conn.execute(
                 "SELECT chunk_refs FROM objects WHERE sha = ?",
-                (obj_sha,),
+                (obj_sha_bin,),
             ).fetchone()
             assert row[0] is not None
-            assert len(bytes(row[0])) == 8  # 1 chunk = 8 bytes
+            rowids = unpack_chunk_refs(bytes(row[0]))
+            assert len(rowids) == 1  # 1 chunk
 
             # Verify data roundtrip through the new schema
             type_num, data = repo.object_store.get_raw(obj_sha.encode("ascii"))
@@ -740,9 +742,10 @@ class TestInlineCompression:
 
             # All inline objects should have compression='zlib'
             for obj_id in [blob.id, tree.id, commit.id]:
+                sha_bin = bytes.fromhex(obj_id.decode("ascii"))
                 row = repo._conn.execute(
                     "SELECT compression FROM objects WHERE sha = ?",
-                    (obj_id.decode("ascii"),),
+                    (sha_bin,),
                 ).fetchone()
                 assert row[0] == "zlib", f"Expected zlib for {obj_id}"
 
@@ -762,9 +765,10 @@ class TestInlineCompression:
             repo.object_store.add_object(blob)
 
             # Verify it's stored inline and compressed
+            sha_bin = bytes.fromhex(blob.id.decode("ascii"))
             row = repo._conn.execute(
                 "SELECT compression, data FROM objects WHERE sha = ?",
-                (blob.id.decode("ascii"),),
+                (sha_bin,),
             ).fetchone()
             assert row[0] == "zlib"
             assert row[1] is not None  # inline
@@ -892,25 +896,26 @@ class TestInlineCompression:
         conn.commit()
         conn.close()
 
-        # Open with SqliteRepo — should trigger v7→v8→v9 migration
+        # Open with SqliteRepo — should trigger v7→v8→v9→v10 migration
         repo = SqliteRepo(db)
         try:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "9"
+            assert row[0] == "10"
 
             # compression column exists with default 'none'
+            sha_bin = bytes.fromhex("abcd" * 10)
             row = repo._conn.execute(
                 "SELECT compression FROM objects WHERE sha = ?",
-                ("abcd" * 10,),
+                (sha_bin,),
             ).fetchone()
             assert row[0] == "none"
 
             # total_size was backfilled
             row = repo._conn.execute(
                 "SELECT total_size, size_bytes FROM objects WHERE sha = ?",
-                ("abcd" * 10,),
+                (sha_bin,),
             ).fetchone()
             assert row[0] == len(b"test inline data")
             assert row[1] == len(b"test inline data")
@@ -918,7 +923,7 @@ class TestInlineCompression:
             # Data still accessible
             row = repo._conn.execute(
                 "SELECT data FROM objects WHERE sha = ?",
-                ("abcd" * 10,),
+                (sha_bin,),
             ).fetchone()
             assert bytes(row[0]) == b"test inline data"
         finally:
@@ -1048,19 +1053,21 @@ class TestInlineCompression:
         obj_rowid = conn.execute(
             "SELECT rowid FROM objects WHERE sha = ?", (obj_sha,)
         ).fetchone()[0]
+        chunk1_sha = "aa" * 32
+        chunk2_sha = "bb" * 32
         conn.execute(
-            "INSERT INTO chunks (chunk_sha, data, compression) VALUES ('chunk1sha', ?, 'none')",
-            (chunk1_data,),
+            "INSERT INTO chunks (chunk_sha, data, compression) VALUES (?, ?, 'none')",
+            (chunk1_sha, chunk1_data),
         )
         chunk1_rowid = conn.execute(
-            "SELECT rowid FROM chunks WHERE chunk_sha = 'chunk1sha'"
+            "SELECT rowid FROM chunks WHERE chunk_sha = ?", (chunk1_sha,)
         ).fetchone()[0]
         conn.execute(
-            "INSERT INTO chunks (chunk_sha, data, compression) VALUES ('chunk2sha', ?, 'none')",
-            (chunk2_data,),
+            "INSERT INTO chunks (chunk_sha, data, compression) VALUES (?, ?, 'none')",
+            (chunk2_sha, chunk2_data),
         )
         chunk2_rowid = conn.execute(
-            "SELECT rowid FROM chunks WHERE chunk_sha = 'chunk2sha'"
+            "SELECT rowid FROM chunks WHERE chunk_sha = ?", (chunk2_sha,)
         ).fetchone()[0]
         conn.execute(
             "INSERT INTO object_chunks (object_id, chunk_index, chunk_id) VALUES (?, 0, ?)",
@@ -1081,13 +1088,13 @@ class TestInlineCompression:
         conn.commit()
         conn.close()
 
-        # Open with SqliteRepo — should trigger v8→v9 migration
+        # Open with SqliteRepo — should trigger v8→v9→v10 migration
         repo = SqliteRepo(db)
         try:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "9"
+            assert row[0] == "10"
 
             # object_chunks table should be gone
             tables = [
@@ -1097,21 +1104,22 @@ class TestInlineCompression:
             ]
             assert "object_chunks" not in tables
 
-            # chunk_refs should be populated for chunked object
+            # chunk_refs should be populated for chunked object (now binary SHA + delta-varint)
+            obj_sha_bin = bytes.fromhex(obj_sha)
             row = repo._conn.execute(
                 "SELECT chunk_refs FROM objects WHERE sha = ?",
-                (obj_sha,),
+                (obj_sha_bin,),
             ).fetchone()
             assert row[0] is not None
-            refs_blob = bytes(row[0])
-            assert len(refs_blob) == 16  # 2 chunks * 8 bytes
-            rowids = struct.unpack('<2Q', refs_blob)
-            assert rowids == (chunk1_rowid, chunk2_rowid)
+            rowids = unpack_chunk_refs(bytes(row[0]))
+            assert len(rowids) == 2
+            assert rowids == [chunk1_rowid, chunk2_rowid]
 
             # Inline object should have NULL chunk_refs
+            inline_sha_bin = bytes.fromhex(inline_sha)
             row = repo._conn.execute(
                 "SELECT chunk_refs FROM objects WHERE sha = ?",
-                (inline_sha,),
+                (inline_sha_bin,),
             ).fetchone()
             assert row[0] is None
 
@@ -1122,6 +1130,213 @@ class TestInlineCompression:
 
             # Inline data should be readable
             type_num, data = repo.object_store.get_raw(inline_sha.encode("ascii"))
+            assert type_num == 3
+            assert data == b"inline data"
+        finally:
+            repo.close()
+
+    def test_v9_to_v10_migration(self, tmp_path):
+        """Create a v9 DB with TEXT SHAs + fixed-8-byte chunk_refs, open, verify binary SHAs + delta-varint."""
+        import struct
+
+        db = str(tmp_path / "v9.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Create v9-style schema (TEXT SHAs, no sha_hex/chunk_sha_hex generated columns)
+        conn.execute(
+            """
+            CREATE TABLE objects (
+                sha TEXT PRIMARY KEY NOT NULL,
+                type_num INTEGER NOT NULL,
+                data BLOB,
+                chunk_refs BLOB,
+                total_size INTEGER,
+                compression TEXT NOT NULL DEFAULT 'none',
+                type_name TEXT GENERATED ALWAYS AS (
+                    CASE type_num
+                        WHEN 1 THEN 'commit'
+                        WHEN 2 THEN 'tree'
+                        WHEN 3 THEN 'blob'
+                        WHEN 4 THEN 'tag'
+                    END
+                ) VIRTUAL,
+                size_bytes INTEGER GENERATED ALWAYS AS (total_size) VIRTUAL,
+                is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE chunks (
+                chunk_sha TEXT PRIMARY KEY NOT NULL,
+                data BLOB NOT NULL,
+                compression TEXT NOT NULL DEFAULT 'none',
+                stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE peeled_refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE named_files (path TEXT PRIMARY KEY NOT NULL, contents BLOB NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE reflog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ref_name BLOB NOT NULL,
+                old_sha BLOB NOT NULL,
+                new_sha BLOB NOT NULL,
+                committer BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                timezone INTEGER NOT NULL,
+                message BLOB NOT NULL,
+                ref_name_text TEXT GENERATED ALWAYS AS (cast(ref_name AS TEXT)) VIRTUAL,
+                old_sha_text TEXT GENERATED ALWAYS AS (cast(old_sha AS TEXT)) VIRTUAL,
+                new_sha_text TEXT GENERATED ALWAYS AS (cast(new_sha AS TEXT)) VIRTUAL,
+                committer_text TEXT GENERATED ALWAYS AS (cast(committer AS TEXT)) VIRTUAL,
+                message_text TEXT GENERATED ALWAYS AS (cast(message AS TEXT)) VIRTUAL,
+                datetime_text TEXT GENERATED ALWAYS AS (datetime(timestamp, 'unixepoch')) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reflog_ref ON reflog (ref_name, id)"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '9')"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('compression', 'none')"
+        )
+
+        # Insert chunks with TEXT SHA-256 hex keys
+        chunk1_sha_hex = "a" * 64
+        chunk2_sha_hex = "b" * 64
+        chunk1_data = b"first chunk data here"
+        chunk2_data = b"second chunk data here"
+        conn.execute(
+            "INSERT INTO chunks (chunk_sha, data, compression) VALUES (?, ?, 'none')",
+            (chunk1_sha_hex, chunk1_data),
+        )
+        chunk1_rowid = conn.execute(
+            "SELECT rowid FROM chunks WHERE chunk_sha = ?", (chunk1_sha_hex,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO chunks (chunk_sha, data, compression) VALUES (?, ?, 'none')",
+            (chunk2_sha_hex, chunk2_data),
+        )
+        chunk2_rowid = conn.execute(
+            "SELECT rowid FROM chunks WHERE chunk_sha = ?", (chunk2_sha_hex,)
+        ).fetchone()[0]
+
+        # Insert chunked object with TEXT SHA and fixed 8-byte LE chunk_refs
+        obj_sha_hex = "deadbeef" * 5
+        packed_refs = struct.pack('<2Q', chunk1_rowid, chunk2_rowid)
+        conn.execute(
+            "INSERT INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
+            "VALUES (?, 3, NULL, ?, ?, 'none')",
+            (obj_sha_hex, packed_refs, len(chunk1_data) + len(chunk2_data)),
+        )
+
+        # Insert inline object with TEXT SHA
+        inline_sha_hex = "abcd" * 10
+        conn.execute(
+            "INSERT INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
+            "VALUES (?, 3, ?, NULL, ?, 'none')",
+            (inline_sha_hex, b"inline data", len(b"inline data")),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteRepo — should trigger v9→v10 migration
+        repo = SqliteRepo(db)
+        try:
+            row = repo._conn.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            assert row[0] == "10"
+
+            # Verify SHAs are now binary BLOB
+            obj_sha_bin = bytes.fromhex(obj_sha_hex)
+            row = repo._conn.execute(
+                "SELECT sha FROM objects WHERE sha = ?",
+                (obj_sha_bin,),
+            ).fetchone()
+            assert row is not None
+            assert isinstance(row[0], bytes)
+            assert len(bytes(row[0])) == 20
+
+            # Verify sha_hex generated column works
+            row = repo._conn.execute(
+                "SELECT sha_hex FROM objects WHERE sha = ?",
+                (obj_sha_bin,),
+            ).fetchone()
+            assert row[0] == obj_sha_hex
+
+            # Verify chunk_sha is now binary BLOB
+            chunk1_sha_bin = bytes.fromhex(chunk1_sha_hex)
+            row = repo._conn.execute(
+                "SELECT chunk_sha FROM chunks WHERE chunk_sha = ?",
+                (chunk1_sha_bin,),
+            ).fetchone()
+            assert row is not None
+            assert len(bytes(row[0])) == 32
+
+            # Verify chunk_sha_hex generated column
+            row = repo._conn.execute(
+                "SELECT chunk_sha_hex FROM chunks WHERE chunk_sha = ?",
+                (chunk1_sha_bin,),
+            ).fetchone()
+            assert row[0] == chunk1_sha_hex
+
+            # Verify chunk_refs are delta-varint encoded
+            row = repo._conn.execute(
+                "SELECT chunk_refs FROM objects WHERE sha = ?",
+                (obj_sha_bin,),
+            ).fetchone()
+            rowids = unpack_chunk_refs(bytes(row[0]))
+            assert rowids == [chunk1_rowid, chunk2_rowid]
+
+            # Inline object has NULL chunk_refs
+            inline_sha_bin = bytes.fromhex(inline_sha_hex)
+            row = repo._conn.execute(
+                "SELECT chunk_refs FROM objects WHERE sha = ?",
+                (inline_sha_bin,),
+            ).fetchone()
+            assert row[0] is None
+
+            # Data roundtrip works
+            type_num, data = repo.object_store.get_raw(obj_sha_hex.encode("ascii"))
+            assert type_num == 3
+            assert data == chunk1_data + chunk2_data
+
+            type_num, data = repo.object_store.get_raw(inline_sha_hex.encode("ascii"))
             assert type_num == 3
             assert data == b"inline data"
         finally:

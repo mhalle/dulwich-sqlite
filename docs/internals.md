@@ -42,10 +42,11 @@ For blobs >= 4096 bytes that produce multiple chunks:
    INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) VALUES (?, ?, ?)
    SELECT rowid FROM chunks WHERE chunk_sha = ?
    ```
+   Where `chunk_sha` is a 32-byte binary SHA-256 digest.
 
-2. Pack all chunk rowids into a binary blob (little-endian 8-byte unsigned integers):
+2. Pack all chunk rowids into a delta-zigzag-varint blob:
    ```python
-   packed = struct.pack(f'<{len(chunk_rowids)}Q', *chunk_rowids)
+   packed = pack_chunk_refs(chunk_rowids)
    ```
 
 3. Insert the object row with NULL data and the packed chunk_refs:
@@ -53,6 +54,25 @@ For blobs >= 4096 bytes that produce multiple chunks:
    INSERT OR REPLACE INTO objects (sha, type_num, data, chunk_refs, total_size, compression)
    VALUES (?, ?, NULL, ?, ?, 'none')
    ```
+   Where `sha` is the 20-byte binary SHA-1 of the Git object.
+
+### Delta-Varint Encoding
+
+The `chunk_refs` blob uses delta-zigzag-varint encoding for compact storage of ordered chunk rowids:
+
+1. **First value**: Encoded as an unsigned LEB128 varint (absolute rowid)
+2. **Subsequent values**: Signed delta from previous value, zigzag-encoded as unsigned LEB128 varint
+3. **Zigzag encoding**: `(delta << 1) ^ (delta >> 63)` — maps signed integers to unsigned, so delta=1 encodes as `0x02` (1 byte instead of 8)
+
+Since ~56% of consecutive chunk rowids differ by exactly 1 (consecutive inserts), most deltas are 1 byte. This reduces `chunk_refs` storage by ~81% compared to fixed 8-byte LE integers.
+
+Use `pack_chunk_refs()` / `unpack_chunk_refs()` from `dulwich_sqlite.object_store` to encode/decode.
+
+### Binary SHA Storage
+
+Object SHAs are stored as 20-byte binary BLOBs (SHA-1) instead of 40-character hex TEXT. Chunk SHAs are stored as 32-byte binary BLOBs (SHA-256) instead of 64-character hex TEXT. This halves storage for both data and indices.
+
+Generated virtual columns `sha_hex` and `chunk_sha_hex` provide lowercase hex representations for human-readable SQL queries without storage overhead.
 
 ## Chunking Algorithms
 

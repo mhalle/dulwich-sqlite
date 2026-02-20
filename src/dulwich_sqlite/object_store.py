@@ -1,7 +1,6 @@
 """SQLite-backed object store for Dulwich."""
 
 import sqlite3
-import struct
 import zlib
 from collections.abc import Callable, Iterable, Iterator
 from typing import BinaryIO, cast
@@ -21,6 +20,59 @@ from ._chunking import chunk_blob
 
 PACK_SPOOL_FILE_MAX_SIZE = 200 * 1024 * 1024
 _BLOB_TYPE_NUM = 3
+
+
+def _encode_unsigned_varint(value: int) -> bytes:
+    """Encode unsigned int as LEB128 varint."""
+    parts = []
+    while value > 0x7F:
+        parts.append((value & 0x7F) | 0x80)
+        value >>= 7
+    parts.append(value & 0x7F)
+    return bytes(parts)
+
+
+def _decode_unsigned_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """Decode LEB128 varint, return (value, new_offset)."""
+    value = shift = 0
+    while True:
+        b = data[offset]
+        value |= (b & 0x7F) << shift
+        offset += 1
+        if not (b & 0x80):
+            break
+        shift += 7
+    return value, offset
+
+
+def pack_chunk_refs(rowids: list[int]) -> bytes:
+    """Pack ordered chunk rowids as delta-zigzag-varint blob."""
+    if not rowids:
+        return b""
+    parts = [_encode_unsigned_varint(rowids[0])]
+    prev = rowids[0]
+    for rid in rowids[1:]:
+        delta = rid - prev
+        zigzag = (delta << 1) ^ (delta >> 63)
+        parts.append(_encode_unsigned_varint(zigzag))
+        prev = rid
+    return b"".join(parts)
+
+
+def unpack_chunk_refs(data: bytes) -> list[int]:
+    """Unpack delta-zigzag-varint blob into ordered chunk rowids."""
+    if not data:
+        return []
+    offset = 0
+    first, offset = _decode_unsigned_varint(data, offset)
+    rowids = [first]
+    prev = first
+    while offset < len(data):
+        zigzag, offset = _decode_unsigned_varint(data, offset)
+        delta = (zigzag >> 1) ^ -(zigzag & 1)
+        prev += delta
+        rowids.append(prev)
+    return rowids
 
 
 class SqliteObjectStore(PackCapableObjectStore):
@@ -50,6 +102,13 @@ class SqliteObjectStore(PackCapableObjectStore):
             return sha_to_hex(cast(RawObjectID, sha))
         else:
             raise ValueError(f"Invalid sha {sha!r}")
+
+    def _to_dbsha(self, sha: ObjectID | RawObjectID) -> bytes:
+        """Convert Dulwich ObjectID/RawObjectID to 20-byte binary for DB lookup."""
+        if len(sha) == self.object_format.oid_length:  # 20 bytes raw
+            return bytes(sha)
+        hexsha = self._to_hexsha(sha)
+        return bytes.fromhex(hexsha.decode("ascii"))
 
     def _compress(self, data: bytes) -> bytes:
         if self._compression == "none":
@@ -82,10 +141,10 @@ class SqliteObjectStore(PackCapableObjectStore):
         raise ValueError(f"Unknown compression method: {method}")
 
     def contains_loose(self, sha: ObjectID | RawObjectID) -> bool:
-        hexsha = self._to_hexsha(sha)
+        dbsha = self._to_dbsha(sha)
         row = self._conn.execute(
             "SELECT 1 FROM objects WHERE sha = ?",
-            (hexsha.decode("ascii"),),
+            (dbsha,),
         ).fetchone()
         return row is not None
 
@@ -94,38 +153,37 @@ class SqliteObjectStore(PackCapableObjectStore):
 
     def __iter__(self) -> Iterator[ObjectID]:
         rows = self._conn.execute("SELECT sha FROM objects").fetchall()
-        for (sha_text,) in rows:
-            yield sha_text.encode("ascii")
+        for (sha_bytes,) in rows:
+            yield bytes(sha_bytes).hex().encode("ascii")
 
     @property
     def packs(self) -> list[Pack]:
         return []
 
     def get_object_size(self, sha: ObjectID | RawObjectID) -> int:
-        hexsha = self._to_hexsha(sha)
+        dbsha = self._to_dbsha(sha)
         row = self._conn.execute(
             "SELECT size_bytes FROM objects WHERE sha = ?",
-            (hexsha.decode("ascii"),),
+            (dbsha,),
         ).fetchone()
         if row is None:
-            raise KeyError(hexsha)
+            raise KeyError(self._to_hexsha(sha))
         return row[0]
 
     def get_raw(self, name: RawObjectID | ObjectID) -> tuple[int, bytes]:
-        hexsha = self._to_hexsha(name)
+        dbsha = self._to_dbsha(name)
         row = self._conn.execute(
             "SELECT type_num, data, compression, chunk_refs FROM objects WHERE sha = ?",
-            (hexsha.decode("ascii"),),
+            (dbsha,),
         ).fetchone()
         if row is None:
-            raise KeyError(hexsha)
+            raise KeyError(self._to_hexsha(name))
         type_num, data, compression, chunk_refs = row
         if data is not None:
             return type_num, self._decompress(bytes(data), compression)
-        # Reassemble from chunks using packed rowids
-        chunk_refs = bytes(chunk_refs)
-        n = len(chunk_refs) // 8
-        rowids = struct.unpack(f'<{n}Q', chunk_refs)
+        # Reassemble from chunks using delta-varint packed rowids
+        rowids = unpack_chunk_refs(bytes(chunk_refs))
+        n = len(rowids)
         placeholders = ','.join('?' * n)
         chunk_rows = self._conn.execute(
             f"SELECT rowid, data, compression FROM chunks WHERE rowid IN ({placeholders})",
@@ -137,7 +195,7 @@ class SqliteObjectStore(PackCapableObjectStore):
 
     def _insert_object(self, obj: ShaFile) -> None:
         """Insert a single object without committing the transaction."""
-        sha_str = obj.id.decode("ascii")
+        sha_bin = bytes.fromhex(obj.id.decode("ascii"))
         raw_data = obj.as_raw_string()
 
         chunks = None
@@ -146,23 +204,23 @@ class SqliteObjectStore(PackCapableObjectStore):
 
         if chunks is not None:
             chunk_rowids = []
-            for chunk_sha, chunk_data in chunks:
+            for chunk_sha_bin, chunk_data in chunks:
                 stored_data = self._compress(chunk_data)
                 self._conn.execute(
                     "INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) "
                     "VALUES (?, ?, ?)",
-                    (chunk_sha, stored_data, self._compression),
+                    (chunk_sha_bin, stored_data, self._compression),
                 )
                 chunk_rowid = self._conn.execute(
                     "SELECT rowid FROM chunks WHERE chunk_sha = ?",
-                    (chunk_sha,),
+                    (chunk_sha_bin,),
                 ).fetchone()[0]
                 chunk_rowids.append(chunk_rowid)
-            packed = struct.pack(f'<{len(chunk_rowids)}Q', *chunk_rowids)
+            packed = pack_chunk_refs(chunk_rowids)
             self._conn.execute(
                 "INSERT OR REPLACE INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
                 "VALUES (?, ?, NULL, ?, ?, 'none')",
-                (sha_str, obj.type_num, packed, len(raw_data)),
+                (sha_bin, obj.type_num, packed, len(raw_data)),
             )
         else:
             # Inline storage
@@ -170,7 +228,7 @@ class SqliteObjectStore(PackCapableObjectStore):
             self._conn.execute(
                 "INSERT OR REPLACE INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
                 "VALUES (?, ?, ?, NULL, ?, ?)",
-                (sha_str, obj.type_num, stored_data, len(raw_data), self._compression),
+                (sha_bin, obj.type_num, stored_data, len(raw_data), self._compression),
             )
 
     def add_object(self, obj: ShaFile) -> None:
@@ -265,7 +323,7 @@ class SqliteObjectStore(PackCapableObjectStore):
             query: Substring to search for in blob content.
             limit: Maximum number of results to return.
         """
-        results: set[str] = set()
+        results: set[bytes] = set()
         query_bytes = query.encode("utf-8", errors="surrogateescape")
 
         # 1. SQL LIKE on uncompressed inline blobs
@@ -275,16 +333,17 @@ class SqliteObjectStore(PackCapableObjectStore):
             "AND CAST(data AS TEXT) LIKE ?",
             (f"%{query}%",),
         ).fetchall():
-            results.add(row[0])
+            results.add(bytes(row[0]))
 
         # 2. Python-side search on compressed inline blobs
         for row in self._conn.execute(
             "SELECT sha, data, compression FROM objects "
             "WHERE data IS NOT NULL AND type_num = 3 AND compression != 'none'"
         ).fetchall():
-            if row[0] not in results:
+            sha_bin = bytes(row[0])
+            if sha_bin not in results:
                 if query_bytes in self._decompress(bytes(row[1]), row[2]):
-                    results.add(row[0])
+                    results.add(sha_bin)
 
         # 3. Find matching chunk rowids (uncompressed via SQL, compressed via Python)
         matching_chunk_rowids: set[int] = set()
@@ -307,14 +366,13 @@ class SqliteObjectStore(PackCapableObjectStore):
                 "SELECT sha, chunk_refs FROM objects "
                 "WHERE chunk_refs IS NOT NULL AND type_num = 3"
             ).fetchall():
-                if row[0] not in results:
-                    refs_blob = bytes(row[1])
-                    n = len(refs_blob) // 8
-                    rowids = set(struct.unpack(f'<{n}Q', refs_blob))
+                sha_bin = bytes(row[0])
+                if sha_bin not in results:
+                    rowids = set(unpack_chunk_refs(bytes(row[1])))
                     if rowids & matching_chunk_rowids:
-                        results.add(row[0])
+                        results.add(sha_bin)
 
         out = list(results)
         if limit is not None:
             out = out[: int(limit)]
-        return [r.encode("ascii") for r in out]
+        return [r.hex().encode("ascii") for r in out]

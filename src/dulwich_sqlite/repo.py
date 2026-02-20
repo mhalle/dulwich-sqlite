@@ -20,6 +20,7 @@ from ._schema import (
     migrate_v6_to_v7,
     migrate_v7_to_v8,
     migrate_v8_to_v9,
+    migrate_v9_to_v10,
 )
 from .object_store import SqliteObjectStore
 from .refs import SqliteRefsContainer
@@ -89,6 +90,9 @@ class SqliteRepo(BaseRepo):
         if version == "8":
             migrate_v8_to_v9(self._conn)
             version = "9"
+        if version == "9":
+            migrate_v9_to_v10(self._conn)
+            version = "10"
         if version != SCHEMA_VERSION:
             raise NotGitRepository(
                 f"Unsupported schema version {version} "

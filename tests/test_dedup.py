@@ -7,7 +7,7 @@ from dulwich.objects import Blob, Tree
 
 from dulwich_sqlite import SqliteRepo
 from dulwich_sqlite._schema import init_db
-from dulwich_sqlite.object_store import SqliteObjectStore
+from dulwich_sqlite.object_store import SqliteObjectStore, unpack_chunk_refs
 
 
 @pytest.fixture
@@ -53,9 +53,10 @@ class TestChunkedStorageRoundtrip:
         blob = Blob.from_string(data)
         store.add_object(blob)
         # Verify data is inline (not NULL)
+        sha_bin = bytes.fromhex(blob.id.decode("ascii"))
         row = store._conn.execute(
             "SELECT data FROM objects WHERE sha = ?",
-            (blob.id.decode("ascii"),),
+            (sha_bin,),
         ).fetchone()
         assert row[0] is not None
 
@@ -63,9 +64,10 @@ class TestChunkedStorageRoundtrip:
         data = b"".join(f"line {i} of the file\n".encode() for i in range(500))
         blob = Blob.from_string(data)
         store.add_object(blob)
+        sha_bin = bytes.fromhex(blob.id.decode("ascii"))
         row = store._conn.execute(
             "SELECT data, total_size FROM objects WHERE sha = ?",
-            (blob.id.decode("ascii"),),
+            (sha_bin,),
         ).fetchone()
         assert row[0] is None
         assert row[1] == len(data)
@@ -77,9 +79,10 @@ class TestChunkedStorageRoundtrip:
         tree = Tree()
         tree.add(b"file.txt", 0o100644, blob.id)
         store.add_object(tree)
+        sha_bin = bytes.fromhex(tree.id.decode("ascii"))
         row = store._conn.execute(
             "SELECT data FROM objects WHERE sha = ?",
-            (tree.id.decode("ascii"),),
+            (sha_bin,),
         ).fetchone()
         assert row[0] is not None
 
@@ -123,7 +126,7 @@ class TestDeduplication:
         for row in store._conn.execute(
             "SELECT chunk_refs FROM objects WHERE chunk_refs IS NOT NULL"
         ).fetchall():
-            total_refs += len(bytes(row[0])) // 8
+            total_refs += len(unpack_chunk_refs(bytes(row[0])))
         unique_chunks = store._conn.execute(
             "SELECT COUNT(*) FROM chunks"
         ).fetchone()[0]
@@ -228,15 +231,23 @@ class TestMigration:
         # Open with SqliteRepo — should trigger migration
         repo = SqliteRepo(db)
         try:
-            # Verify version is now 9 (v3→v4→...→v9 chain)
+            # Verify version is now 10 (v3→v4→...→v10 chain)
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "9"
+            assert row[0] == "10"
 
-            # Verify old data is still accessible
+            # Verify old data is still accessible (SHA is now binary)
+            sha_bin = bytes.fromhex("abcd" * 10)
             row = repo._conn.execute(
                 "SELECT data FROM objects WHERE sha = ?",
+                (sha_bin,),
+            ).fetchone()
+            assert bytes(row[0]) == b"test data"
+
+            # Also accessible via sha_hex generated column
+            row = repo._conn.execute(
+                "SELECT data FROM objects WHERE sha_hex = ?",
                 ("abcd" * 10,),
             ).fetchone()
             assert bytes(row[0]) == b"test data"
@@ -253,7 +264,7 @@ class TestMigration:
             # Verify chunk_refs column works
             row = repo._conn.execute(
                 "SELECT chunk_refs FROM objects WHERE sha = ?",
-                ("abcd" * 10,),
+                (sha_bin,),
             ).fetchone()
             assert row[0] is None  # inline object has no chunk_refs
         finally:

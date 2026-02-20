@@ -2,6 +2,19 @@
 
 All notable changes to dulwich-sqlite are documented in this file.
 
+## [0.5.0] — 2026-02-19
+
+### Changed
+
+- **Schema v10**: Binary SHAs + delta-varint chunk_refs
+  - `objects.sha` changed from TEXT(40) to BLOB(20) — halves SHA storage and index size
+  - `chunks.chunk_sha` changed from TEXT(64) to BLOB(32) — halves chunk SHA storage and index size
+  - Added `sha_hex` and `chunk_sha_hex` generated virtual columns for human-readable SQL queries
+  - `chunk_refs` re-encoded from fixed 8-byte little-endian integers to delta-zigzag-varint format (~81% smaller)
+  - `_chunking.py` now returns 32-byte binary SHA-256 digests instead of hex strings
+  - Automatic migration from v9 on open (rebuilds both tables, preserves chunk rowids, re-encodes chunk_refs)
+  - Combined estimated savings: ~15 MB for a typical large repository (77.9 MB → ~63 MB)
+
 ## [0.4.0] — 2026-02-19
 
 ### Changed

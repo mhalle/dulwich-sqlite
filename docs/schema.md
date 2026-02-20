@@ -4,7 +4,7 @@ dulwich-sqlite stores all repository data in a single SQLite database. This docu
 
 ## Schema Version
 
-The current schema version is **9**. The version is stored in the `metadata` table under the key `schema_version`.
+The current schema version is **10**. The version is stored in the `metadata` table under the key `schema_version`.
 
 ### Version History
 
@@ -17,8 +17,9 @@ The current schema version is **9**. The version is stored in the `metadata` tab
 | v7 | Integer keys in `object_chunks`: replaced `object_sha`/`chunk_sha` text columns with `object_id`/`chunk_id` integer rowid references. Added zstd compression support |
 | v8 | Inline object compression: added `compression` column to `objects` table. Changed `size_bytes` to use `total_size` (always set). Inline objects (commits, trees, tags, small blobs) are now compressed when compression is enabled |
 | v9 | Inline chunk lists: replaced `object_chunks` table with `chunk_refs BLOB` column on `objects`. Packed little-endian 8-byte rowids eliminate the join table entirely |
+| v10 | Binary SHAs + delta-varint chunk_refs: `objects.sha` changed from TEXT(40) to BLOB(20), `chunks.chunk_sha` from TEXT(64) to BLOB(32). Added `sha_hex`/`chunk_sha_hex` generated columns. `chunk_refs` re-encoded from fixed 8-byte LE to delta-zigzag-varint (~81% smaller) |
 
-Migration from v3 through v8 happens automatically when opening a database with `SqliteRepo()`.
+Migration from v3 through v9 happens automatically when opening a database with `SqliteRepo()`.
 
 ## Pragmas
 
@@ -44,12 +45,13 @@ Stores all Git objects (blobs, trees, commits, tags).
 
 ```sql
 CREATE TABLE objects (
-    sha TEXT PRIMARY KEY NOT NULL,
+    sha BLOB PRIMARY KEY NOT NULL,
     type_num INTEGER NOT NULL,
     data BLOB,
     chunk_refs BLOB,
     total_size INTEGER,
     compression TEXT NOT NULL DEFAULT 'none',
+    sha_hex TEXT GENERATED ALWAYS AS (lower(hex(sha))) VIRTUAL,
     type_name TEXT GENERATED ALWAYS AS (
         CASE type_num
             WHEN 1 THEN 'commit'
@@ -65,23 +67,25 @@ CREATE TABLE objects (
 
 | Column | Type | Description |
 |---|---|---|
-| `sha` | TEXT PK | Hex-encoded SHA-1 of the Git object |
+| `sha` | BLOB PK | 20-byte binary SHA-1 of the Git object |
 | `type_num` | INTEGER | Git object type: 1=commit, 2=tree, 3=blob, 4=tag |
 | `data` | BLOB (nullable) | Object data, possibly compressed. NULL for chunked blobs (data is in the `chunks` table) |
-| `chunk_refs` | BLOB (nullable) | Packed chunk rowids for chunked objects. NULL for inline objects. Little-endian 8-byte unsigned integers (`struct.pack('<NQ', ...)`). Length / 8 = chunk count |
+| `chunk_refs` | BLOB (nullable) | Packed chunk rowids for chunked objects. NULL for inline objects. Delta-zigzag-varint encoded (see Internals) |
 | `total_size` | INTEGER | Total raw (uncompressed) data size in bytes. Always set for both inline and chunked objects |
 | `compression` | TEXT | Compression method for inline data: `'none'`, `'zlib'`, or `'zstd'`. Always `'none'` for chunked objects (their chunks have their own compression) |
+| `sha_hex` | TEXT (generated) | Lowercase hex encoding of `sha` for human-readable queries |
 | `type_name` | TEXT (generated) | Human-readable type name derived from `type_num` |
 | `size_bytes` | INTEGER (generated) | Object size in bytes, derived from `total_size` |
 | `is_chunked` | INTEGER (generated) | 1 if the object is chunked (data is NULL), 0 if inline |
 
 **Notes:**
 - Inline objects have `data` populated, `chunk_refs` as NULL, and `total_size` set to the raw data size
-- Chunked objects have `data` as NULL, `chunk_refs` packed with ordered chunk rowids, and `total_size` set to the total reassembled size
+- Chunked objects have `data` as NULL, `chunk_refs` packed with ordered chunk rowids (delta-zigzag-varint), and `total_size` set to the total reassembled size
 - Non-blob objects (commits, trees, tags) are always stored inline
 - Only blobs >= 4096 bytes that produce multiple chunks are stored in chunked form
 - When compression is enabled, inline data is compressed; decompress using the `compression` column value
-- The `chunk_refs` blob is opaque binary — use the Python API or `struct` to unpack the rowids
+- The `chunk_refs` blob is opaque binary — use the Python API (`unpack_chunk_refs()`) to decode the delta-varint rowids
+- Use the `sha_hex` generated column for human-readable queries (e.g., `WHERE sha_hex LIKE 'a1b2c3%'`)
 
 ### `chunks`
 
@@ -89,22 +93,25 @@ Deduplicated content chunks keyed by SHA-256.
 
 ```sql
 CREATE TABLE chunks (
-    chunk_sha TEXT PRIMARY KEY NOT NULL,
+    chunk_sha BLOB PRIMARY KEY NOT NULL,
     data BLOB NOT NULL,
     compression TEXT NOT NULL DEFAULT 'none',
+    chunk_sha_hex TEXT GENERATED ALWAYS AS (lower(hex(chunk_sha))) VIRTUAL,
     stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
 );
 ```
 
 | Column | Type | Description |
 |---|---|---|
-| `chunk_sha` | TEXT PK | SHA-256 hex digest of the **raw** (uncompressed) chunk data |
+| `chunk_sha` | BLOB PK | 32-byte binary SHA-256 digest of the **raw** (uncompressed) chunk data |
 | `data` | BLOB | Chunk data, possibly compressed |
 | `compression` | TEXT | Compression method: `'none'`, `'zlib'`, or `'zstd'` |
+| `chunk_sha_hex` | TEXT (generated) | Lowercase hex encoding of `chunk_sha` for human-readable queries |
 | `stored_size` | INTEGER (generated) | On-disk size of the stored data in bytes (may differ from raw size if compressed) |
 
 **Notes:**
 - The SHA-256 key is always computed on raw data, regardless of whether the stored data is compressed. This ensures deduplication works across compression modes
+- Use the `chunk_sha_hex` generated column for human-readable queries
 - Chunks are inserted with `INSERT OR IGNORE`, so if two objects share the same chunk, only the first copy is stored
 - A single database can have a mix of `'none'`, `'zlib'`, and `'zstd'` chunks
 
@@ -183,7 +190,7 @@ CREATE TABLE metadata (
 
 | Key | Values | Description |
 |---|---|---|
-| `schema_version` | `"3"` through `"9"` | Current schema version |
+| `schema_version` | `"3"` through `"10"` | Current schema version |
 | `compression` | `"none"`, `"zlib"`, `"zstd"` | Current compression setting for new chunks |
 
 ### `reflog`
@@ -303,3 +310,13 @@ Replaced the `object_chunks` join table with inline `chunk_refs` BLOB:
 5. Schema version updated to `"9"`
 
 This eliminates the `object_chunks` table entirely (~45% of database size for large repos), replacing it with a compact binary blob on each chunked object row. The packed format uses `struct.pack('<NQ', ...)` — length / 8 = chunk count.
+
+### v9 to v10
+
+Binary SHAs and delta-varint chunk_refs:
+
+1. `chunks` table rebuilt: `chunk_sha` column changed from TEXT(64) to BLOB(32). `chunk_sha_hex TEXT GENERATED ALWAYS AS (lower(hex(chunk_sha))) VIRTUAL` added for queryability. Rowids preserved explicitly to maintain chunk_refs correctness
+2. `objects` table rebuilt: `sha` column changed from TEXT(40) to BLOB(20). `sha_hex TEXT GENERATED ALWAYS AS (lower(hex(sha))) VIRTUAL` added. `chunk_refs` re-encoded from fixed 8-byte little-endian integers to delta-zigzag-varint format
+3. Schema version updated to `"10"`
+
+Binary SHAs halve storage for both SHA columns and their indices. Delta-varint encoding reduces `chunk_refs` by ~81% — consecutive chunk rowids (delta=1) encode to a single byte instead of 8. Combined savings: ~15 MB for a typical large repository.

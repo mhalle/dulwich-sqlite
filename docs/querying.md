@@ -22,7 +22,7 @@ conn = sqlite3.connect("my-repo.db")
 ### List All Objects
 
 ```sql
-SELECT sha, type_name, size_bytes FROM objects;
+SELECT sha_hex, type_name, size_bytes FROM objects;
 ```
 
 ### Filter by Type
@@ -30,10 +30,10 @@ SELECT sha, type_name, size_bytes FROM objects;
 The `type_name` generated column maps numeric types to human-readable names:
 
 ```sql
-SELECT sha, size_bytes FROM objects WHERE type_name = 'commit';
-SELECT sha, size_bytes FROM objects WHERE type_name = 'tree';
-SELECT sha, size_bytes FROM objects WHERE type_name = 'blob';
-SELECT sha, size_bytes FROM objects WHERE type_name = 'tag';
+SELECT sha_hex, size_bytes FROM objects WHERE type_name = 'commit';
+SELECT sha_hex, size_bytes FROM objects WHERE type_name = 'tree';
+SELECT sha_hex, size_bytes FROM objects WHERE type_name = 'blob';
+SELECT sha_hex, size_bytes FROM objects WHERE type_name = 'tag';
 ```
 
 The underlying `type_num` values are 1=commit, 2=tree, 3=blob, 4=tag if you prefer numeric filters.
@@ -49,19 +49,19 @@ GROUP BY type_name;
 ### Find by SHA Prefix
 
 ```sql
-SELECT sha, type_name, size_bytes
+SELECT sha_hex, type_name, size_bytes
 FROM objects
-WHERE sha LIKE 'a1b2c3%';
+WHERE sha_hex LIKE 'a1b2c3%';
 ```
 
 ### Inline vs Chunked Objects
 
 ```sql
 -- Inline objects (data stored directly)
-SELECT sha, type_name, size_bytes FROM objects WHERE NOT is_chunked;
+SELECT sha_hex, type_name, size_bytes FROM objects WHERE NOT is_chunked;
 
 -- Chunked objects (data stored in chunks table)
-SELECT sha, type_name, size_bytes FROM objects WHERE is_chunked;
+SELECT sha_hex, type_name, size_bytes FROM objects WHERE is_chunked;
 ```
 
 ## Blob Content
@@ -72,7 +72,7 @@ For small blobs stored inline, the data is directly in the `objects` table. Note
 
 ```sql
 -- Uncompressed inline blobs can be read directly
-SELECT sha, CAST(data AS TEXT) FROM objects
+SELECT sha_hex, CAST(data AS TEXT) FROM objects
 WHERE type_name = 'blob' AND NOT is_chunked AND compression = 'none'
 LIMIT 5;
 ```
@@ -81,10 +81,9 @@ For compressed inline blobs, use the Python API or decompress in your applicatio
 
 ### Reassembling Chunked Blobs
 
-Chunked blobs have `data IS NULL` and `chunk_refs` populated. The `chunk_refs` column is a packed binary blob of little-endian 8-byte unsigned integers, each being a rowid into the `chunks` table. Use the Python API to reassemble:
+Chunked blobs have `data IS NULL` and `chunk_refs` populated. The `chunk_refs` column is a delta-zigzag-varint encoded blob of rowids into the `chunks` table. Use the Python API to reassemble:
 
 ```python
-import struct
 from dulwich_sqlite import SqliteRepo
 
 repo = SqliteRepo("my-repo.db")
@@ -95,15 +94,14 @@ repo.close()
 For direct SQL access to individual chunks of a chunked object, you need to unpack the `chunk_refs` blob in Python first:
 
 ```python
-import sqlite3, struct
+import sqlite3
+from dulwich_sqlite.object_store import unpack_chunk_refs
 
 conn = sqlite3.connect("my-repo.db")
 row = conn.execute(
-    "SELECT chunk_refs FROM objects WHERE sha = 'abc123...'"
+    "SELECT chunk_refs FROM objects WHERE sha_hex = 'abc123...'"
 ).fetchone()
-refs = bytes(row[0])
-n = len(refs) // 8
-rowids = struct.unpack(f'<{n}Q', refs)
+rowids = unpack_chunk_refs(bytes(row[0]))
 # Now fetch chunks by rowid
 for rid in rowids:
     chunk = conn.execute(
@@ -112,7 +110,7 @@ for rid in rowids:
     # decompress if needed based on compression column
 ```
 
-**Note:** The `chunk_refs` blob is opaque binary. SQL-only chunk reassembly is not practical — use the Python API for chunked objects.
+**Note:** The `chunk_refs` blob uses delta-varint encoding. SQL-only chunk reassembly is not practical — use the Python API for chunked objects.
 
 ## Chunk Queries
 
@@ -134,14 +132,15 @@ GROUP BY compression;
 Count how many objects are chunked and total chunk references:
 
 ```python
-import sqlite3, struct
+import sqlite3
+from dulwich_sqlite.object_store import unpack_chunk_refs
 
 conn = sqlite3.connect("my-repo.db")
 total_refs = 0
 chunked_count = 0
 for row in conn.execute("SELECT chunk_refs FROM objects WHERE chunk_refs IS NOT NULL"):
     chunked_count += 1
-    total_refs += len(bytes(row[0])) // 8
+    total_refs += len(unpack_chunk_refs(bytes(row[0])))
 
 unique_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
 print(f"Chunked objects: {chunked_count}")
@@ -150,7 +149,7 @@ print(f"Unique chunks: {unique_chunks}")
 print(f"Duplicates avoided: {total_refs - unique_chunks}")
 ```
 
-**Note:** Since schema v9, chunk references are packed into the `chunk_refs` BLOB column on the `objects` table. The `object_chunks` join table no longer exists. Deduplication statistics require Python-side unpacking.
+**Note:** Since schema v9, chunk references are packed into the `chunk_refs` BLOB column on the `objects` table (delta-varint encoded since v10). The `object_chunks` join table no longer exists. Deduplication statistics require Python-side unpacking via `unpack_chunk_refs()`.
 
 ## Text Search
 
@@ -159,7 +158,7 @@ print(f"Duplicates avoided: {total_refs - unique_chunks}")
 Search for a substring in uncompressed inline blobs:
 
 ```sql
-SELECT sha
+SELECT sha_hex
 FROM objects
 WHERE type_name = 'blob'
   AND NOT is_chunked
@@ -189,7 +188,7 @@ repo.close()
 3. SQL `LIKE` on uncompressed chunks + Python-side search on compressed chunks
 4. Scan chunked objects' `chunk_refs` blobs for matching chunk rowids
 
-**Note:** Since schema v9, chunk-to-object mappings are stored as packed binary in `chunk_refs`. Direct SQL queries for chunk content search across objects are no longer practical — use `search_content()` instead.
+**Note:** Since schema v9, chunk-to-object mappings are stored as packed binary in `chunk_refs` (delta-varint encoded since v10). Direct SQL queries for chunk content search across objects are no longer practical — use `search_content()` instead.
 
 ## Ref Queries
 
@@ -314,7 +313,7 @@ ORDER BY total_bytes DESC;
 ### Largest Objects
 
 ```sql
-SELECT sha, type_name, size_bytes
+SELECT sha_hex, type_name, size_bytes
 FROM objects
 ORDER BY size_bytes DESC
 LIMIT 10;

@@ -3,7 +3,7 @@
 import sqlite3
 import struct
 
-SCHEMA_VERSION = "9"
+SCHEMA_VERSION = "10"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -14,12 +14,13 @@ PRAGMAS = [
 CREATE_TABLES = [
     """
     CREATE TABLE IF NOT EXISTS objects (
-        sha TEXT PRIMARY KEY NOT NULL,
+        sha BLOB PRIMARY KEY NOT NULL,
         type_num INTEGER NOT NULL,
         data BLOB,
         chunk_refs BLOB,
         total_size INTEGER,
         compression TEXT NOT NULL DEFAULT 'none',
+        sha_hex TEXT GENERATED ALWAYS AS (lower(hex(sha))) VIRTUAL,
         type_name TEXT GENERATED ALWAYS AS (
             CASE type_num
                 WHEN 1 THEN 'commit'
@@ -34,9 +35,10 @@ CREATE_TABLES = [
     """,
     """
     CREATE TABLE IF NOT EXISTS chunks (
-        chunk_sha TEXT PRIMARY KEY NOT NULL,
+        chunk_sha BLOB PRIMARY KEY NOT NULL,
         data BLOB NOT NULL,
         compression TEXT NOT NULL DEFAULT 'none',
+        chunk_sha_hex TEXT GENERATED ALWAYS AS (lower(hex(chunk_sha))) VIRTUAL,
         stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
     )
     """,
@@ -368,5 +370,90 @@ def migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS object_chunks")
     conn.execute(
         "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
+    )
+    conn.commit()
+
+
+def migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
+    """Migrate a v9 database to v10 schema.
+
+    Converts TEXT SHA columns to BLOB for both objects and chunks tables,
+    adds generated hex columns for queryability, and re-encodes chunk_refs
+    from fixed 8-byte LE integers to delta-zigzag-varint format.
+    """
+    from .object_store import pack_chunk_refs
+
+    # 1. Rebuild chunks table: TEXT PK → BLOB PK
+    conn.execute(
+        """
+        CREATE TABLE chunks_new (
+            chunk_sha BLOB PRIMARY KEY NOT NULL,
+            data BLOB NOT NULL,
+            compression TEXT NOT NULL DEFAULT 'none',
+            chunk_sha_hex TEXT GENERATED ALWAYS AS (lower(hex(chunk_sha))) VIRTUAL,
+            stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
+        )
+        """
+    )
+    # Preserve rowids explicitly so chunk_refs still point correctly
+    for row in conn.execute(
+        "SELECT rowid, chunk_sha, data, compression FROM chunks"
+    ).fetchall():
+        rowid, chunk_sha_text, data, compression = row
+        chunk_sha_bin = bytes.fromhex(chunk_sha_text)
+        conn.execute(
+            "INSERT INTO chunks_new (rowid, chunk_sha, data, compression) VALUES (?, ?, ?, ?)",
+            (rowid, chunk_sha_bin, data, compression),
+        )
+    conn.execute("DROP TABLE chunks")
+    conn.execute("ALTER TABLE chunks_new RENAME TO chunks")
+
+    # 2. Rebuild objects table: TEXT PK → BLOB PK, re-encode chunk_refs
+    conn.execute(
+        """
+        CREATE TABLE objects_new (
+            sha BLOB PRIMARY KEY NOT NULL,
+            type_num INTEGER NOT NULL,
+            data BLOB,
+            chunk_refs BLOB,
+            total_size INTEGER,
+            compression TEXT NOT NULL DEFAULT 'none',
+            sha_hex TEXT GENERATED ALWAYS AS (lower(hex(sha))) VIRTUAL,
+            type_name TEXT GENERATED ALWAYS AS (
+                CASE type_num
+                    WHEN 1 THEN 'commit'
+                    WHEN 2 THEN 'tree'
+                    WHEN 3 THEN 'blob'
+                    WHEN 4 THEN 'tag'
+                END
+            ) VIRTUAL,
+            size_bytes INTEGER GENERATED ALWAYS AS (total_size) VIRTUAL,
+            is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
+        )
+        """
+    )
+    for row in conn.execute(
+        "SELECT sha, type_num, data, chunk_refs, total_size, compression FROM objects"
+    ).fetchall():
+        sha_text, type_num, data, chunk_refs_blob, total_size, compression = row
+        sha_bin = bytes.fromhex(sha_text)
+        # Re-encode chunk_refs from fixed 8-byte LE to delta-varint
+        new_chunk_refs = None
+        if chunk_refs_blob is not None:
+            old_blob = bytes(chunk_refs_blob)
+            n = len(old_blob) // 8
+            rowids = list(struct.unpack(f'<{n}Q', old_blob))
+            new_chunk_refs = pack_chunk_refs(rowids)
+        conn.execute(
+            "INSERT INTO objects_new (sha, type_num, data, chunk_refs, total_size, compression) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sha_bin, type_num, data, new_chunk_refs, total_size, compression),
+        )
+    conn.execute("DROP TABLE objects")
+    conn.execute("ALTER TABLE objects_new RENAME TO objects")
+
+    # 3. Update schema version
+    conn.execute(
+        "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
     )
     conn.commit()

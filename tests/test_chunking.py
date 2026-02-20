@@ -48,8 +48,8 @@ class TestChunkText:
     def test_sha256_correct(self):
         data = b"hello\nworld\nfoo\nbar\nbaz\n" * 20
         chunks = chunk_text(data)
-        for sha_hex, chunk_data in chunks:
-            assert sha_hex == hashlib.sha256(chunk_data).hexdigest()
+        for sha_bin, chunk_data in chunks:
+            assert sha_bin == hashlib.sha256(chunk_data).digest()
 
     def test_single_line(self):
         data = b"just one line\n"
@@ -97,8 +97,8 @@ class TestChunkBinary:
     def test_sha256_correct(self):
         data = self._random_binary()
         chunks = chunk_binary(data)
-        for sha_hex, chunk_data in chunks:
-            assert sha_hex == hashlib.sha256(chunk_data).hexdigest()
+        for sha_bin, chunk_data in chunks:
+            assert sha_bin == hashlib.sha256(chunk_data).digest()
 
 
 class TestChunkBlob:
@@ -141,4 +141,4 @@ class TestChunkBlob:
             # If chunks aligned, some shas should repeat
             # (not guaranteed by CDC, but test the sha computation is consistent)
             for sha, chunk_data in result:
-                assert sha == hashlib.sha256(chunk_data).hexdigest()
+                assert sha == hashlib.sha256(chunk_data).digest()

@@ -10,7 +10,7 @@
 SqliteRepo(db_path: str)
 ```
 
-Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3 through v8 databases to the current schema (v9).
+Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3 through v9 databases to the current schema (v10).
 
 **Raises:** `NotGitRepository` if the file is not a valid dulwich-sqlite database or has an unsupported schema version.
 
