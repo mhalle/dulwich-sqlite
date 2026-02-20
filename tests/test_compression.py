@@ -8,7 +8,7 @@ import pytest
 from dulwich.objects import Blob
 
 from dulwich_sqlite import SqliteRepo
-from dulwich_sqlite._schema import init_db, migrate_v4_to_v5, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9, migrate_v9_to_v10
+from dulwich_sqlite._schema import init_db, migrate_v4_to_v5, migrate_v6_to_v7, migrate_v7_to_v8, migrate_v8_to_v9, migrate_v9_to_v10, migrate_v10_to_v11
 from dulwich_sqlite.object_store import SqliteObjectStore, unpack_chunk_refs
 
 
@@ -376,7 +376,7 @@ class TestMigration:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "10"
+            assert row[0] == "11"
 
             # compression metadata inserted
             row = repo._conn.execute(
@@ -919,7 +919,7 @@ class TestChunkRefs:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "10"
+            assert row[0] == "11"
 
             # Verify object_chunks table is gone
             tables = [
@@ -1132,7 +1132,7 @@ class TestInlineCompression:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "10"
+            assert row[0] == "11"
 
             # compression column exists with default 'none'
             sha_bin = bytes.fromhex("abcd" * 10)
@@ -1324,7 +1324,7 @@ class TestInlineCompression:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "10"
+            assert row[0] == "11"
 
             # object_chunks table should be gone
             tables = [
@@ -1510,7 +1510,7 @@ class TestInlineCompression:
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "10"
+            assert row[0] == "11"
 
             # Verify SHAs are now binary BLOB
             obj_sha_bin = bytes.fromhex(obj_sha_hex)
@@ -1569,5 +1569,331 @@ class TestInlineCompression:
             type_num, data = repo.object_store.get_raw(inline_sha_hex.encode("ascii"))
             assert type_num == 3
             assert data == b"inline data"
+        finally:
+            repo.close()
+
+
+class TestByteRangeAccess:
+    def test_range_read_chunked_object(self, tmp_path):
+        """Read a range from the middle of a large chunked blob."""
+        db = str(tmp_path / "range.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = b"A" * 5000 + b"NEEDLE" + b"B" * 50000
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            type_num, ranged = repo.object_store.get_raw_range(blob.id, 5000, 6)
+            assert type_num == 3
+            assert ranged == b"NEEDLE"
+
+            # Verify consistency with full read
+            _, full = repo.object_store.get_raw(blob.id)
+            assert ranged == full[5000:5006]
+        finally:
+            repo.close()
+
+    def test_range_read_inline_object(self, tmp_path):
+        """Read a range from a small inline blob."""
+        db = str(tmp_path / "range_inline.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = b"hello world"
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            type_num, ranged = repo.object_store.get_raw_range(blob.id, 6, 5)
+            assert type_num == 3
+            assert ranged == b"world"
+        finally:
+            repo.close()
+
+    def test_range_read_clamps_to_bounds(self, tmp_path):
+        """Request range beyond object size returns available data."""
+        db = str(tmp_path / "range_clamp.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = b"short data"
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            type_num, ranged = repo.object_store.get_raw_range(blob.id, 5, 100)
+            assert ranged == b" data"
+        finally:
+            repo.close()
+
+    def test_range_read_offset_beyond_size(self, tmp_path):
+        """Request offset past end returns empty bytes."""
+        db = str(tmp_path / "range_past.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = b"short"
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            type_num, ranged = repo.object_store.get_raw_range(blob.id, 100, 10)
+            assert ranged == b""
+        finally:
+            repo.close()
+
+    def test_range_read_compressed_chunks(self, tmp_path):
+        """Range read works with compressed chunks."""
+        db = str(tmp_path / "range_comp.db")
+        repo = SqliteRepo.init_bare(db, compress="zlib")
+        try:
+            data = _large_text("compressed_range")
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            _, full = repo.object_store.get_raw(blob.id)
+            type_num, ranged = repo.object_store.get_raw_range(blob.id, 100, 50)
+            assert ranged == full[100:150]
+        finally:
+            repo.close()
+
+    def test_range_read_first_chunk_only(self, tmp_path):
+        """Reading within the first chunk only fetches that chunk."""
+        db = str(tmp_path / "range_first.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = _large_text("first_chunk_test", n=500)
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            # Verify it's chunked
+            sha_bin = bytes.fromhex(blob.id.decode("ascii"))
+            row = repo._conn.execute(
+                "SELECT chunk_refs FROM objects WHERE sha = ?", (sha_bin,)
+            ).fetchone()
+            assert row[0] is not None
+            rowids = unpack_chunk_refs(bytes(row[0]))
+            assert len(rowids) > 1  # Multiple chunks
+
+            # Read a small range at the beginning
+            _, full = repo.object_store.get_raw(blob.id)
+            type_num, ranged = repo.object_store.get_raw_range(blob.id, 0, 10)
+            assert ranged == full[:10]
+        finally:
+            repo.close()
+
+    def test_range_read_spanning_two_chunks(self, tmp_path):
+        """Read a range crossing a chunk boundary."""
+        db = str(tmp_path / "range_span.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = _large_text("span_test", n=500)
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            _, full = repo.object_store.get_raw(blob.id)
+
+            # Get chunk sizes to find boundary
+            sha_bin = bytes.fromhex(blob.id.decode("ascii"))
+            row = repo._conn.execute(
+                "SELECT chunk_refs FROM objects WHERE sha = ?", (sha_bin,)
+            ).fetchone()
+            rowids = unpack_chunk_refs(bytes(row[0]))
+            first_size = repo._conn.execute(
+                "SELECT raw_size FROM chunks WHERE rowid = ?", (rowids[0],)
+            ).fetchone()[0]
+
+            # Read across the boundary
+            boundary = first_size - 5
+            type_num, ranged = repo.object_store.get_raw_range(blob.id, boundary, 20)
+            assert ranged == full[boundary:boundary + 20]
+        finally:
+            repo.close()
+
+    def test_v10_to_v11_migration(self, tmp_path):
+        """Create a v10 DB manually, open with SqliteRepo, verify migration."""
+        db = str(tmp_path / "v10.db")
+        conn = sqlite3.connect(db)
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Create v10-style schema (no raw_size on chunks)
+        conn.execute(
+            """
+            CREATE TABLE objects (
+                sha BLOB PRIMARY KEY NOT NULL,
+                type_num INTEGER NOT NULL,
+                data BLOB,
+                chunk_refs BLOB,
+                total_size INTEGER,
+                compression TEXT NOT NULL DEFAULT 'none',
+                sha_hex TEXT GENERATED ALWAYS AS (lower(hex(sha))) VIRTUAL,
+                type_name TEXT GENERATED ALWAYS AS (
+                    CASE type_num
+                        WHEN 1 THEN 'commit'
+                        WHEN 2 THEN 'tree'
+                        WHEN 3 THEN 'blob'
+                        WHEN 4 THEN 'tag'
+                    END
+                ) VIRTUAL,
+                size_bytes INTEGER GENERATED ALWAYS AS (total_size) VIRTUAL,
+                is_chunked INTEGER GENERATED ALWAYS AS (data IS NULL) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE chunks (
+                chunk_sha BLOB PRIMARY KEY NOT NULL,
+                data BLOB NOT NULL,
+                compression TEXT NOT NULL DEFAULT 'none',
+                chunk_sha_hex TEXT GENERATED ALWAYS AS (lower(hex(chunk_sha))) VIRTUAL,
+                stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE peeled_refs (
+                name BLOB PRIMARY KEY NOT NULL,
+                value BLOB NOT NULL,
+                name_hex TEXT GENERATED ALWAYS AS (hex(name)) VIRTUAL,
+                value_hex TEXT GENERATED ALWAYS AS (hex(value)) VIRTUAL,
+                name_text TEXT GENERATED ALWAYS AS (cast(name AS TEXT)) VIRTUAL,
+                value_text TEXT GENERATED ALWAYS AS (cast(value AS TEXT)) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE TABLE named_files (path TEXT PRIMARY KEY NOT NULL, contents BLOB NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE reflog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ref_name BLOB NOT NULL,
+                old_sha BLOB NOT NULL,
+                new_sha BLOB NOT NULL,
+                committer BLOB NOT NULL,
+                timestamp INTEGER NOT NULL,
+                timezone INTEGER NOT NULL,
+                message BLOB NOT NULL,
+                ref_name_text TEXT GENERATED ALWAYS AS (cast(ref_name AS TEXT)) VIRTUAL,
+                old_sha_text TEXT GENERATED ALWAYS AS (cast(old_sha AS TEXT)) VIRTUAL,
+                new_sha_text TEXT GENERATED ALWAYS AS (cast(new_sha AS TEXT)) VIRTUAL,
+                committer_text TEXT GENERATED ALWAYS AS (cast(committer AS TEXT)) VIRTUAL,
+                message_text TEXT GENERATED ALWAYS AS (cast(message AS TEXT)) VIRTUAL,
+                datetime_text TEXT GENERATED ALWAYS AS (datetime(timestamp, 'unixepoch')) VIRTUAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reflog_ref ON reflog (ref_name, id)"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '10')"
+        )
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('compression', 'none')"
+        )
+
+        # Insert test chunks (uncompressed)
+        chunk1_data = b"first chunk data for migration test"
+        chunk2_data = b"second chunk data for migration test"
+        chunk1_sha = hashlib.sha256(chunk1_data).digest()
+        chunk2_sha = hashlib.sha256(chunk2_data).digest()
+        conn.execute(
+            "INSERT INTO chunks (chunk_sha, data, compression) VALUES (?, ?, 'none')",
+            (chunk1_sha, chunk1_data),
+        )
+        chunk1_rowid = conn.execute(
+            "SELECT rowid FROM chunks WHERE chunk_sha = ?", (chunk1_sha,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO chunks (chunk_sha, data, compression) VALUES (?, ?, 'none')",
+            (chunk2_sha, chunk2_data),
+        )
+        chunk2_rowid = conn.execute(
+            "SELECT rowid FROM chunks WHERE chunk_sha = ?", (chunk2_sha,)
+        ).fetchone()[0]
+
+        # Insert chunked object
+        from dulwich_sqlite.object_store import pack_chunk_refs
+        obj_sha = bytes.fromhex("deadbeef" * 5)
+        packed = pack_chunk_refs([chunk1_rowid, chunk2_rowid])
+        conn.execute(
+            "INSERT INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
+            "VALUES (?, 3, NULL, ?, ?, 'none')",
+            (obj_sha, packed, len(chunk1_data) + len(chunk2_data)),
+        )
+
+        # Insert inline object
+        inline_sha = bytes.fromhex("abcd" * 10)
+        conn.execute(
+            "INSERT INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
+            "VALUES (?, 3, ?, NULL, ?, 'none')",
+            (inline_sha, b"inline data", len(b"inline data")),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SqliteRepo — should trigger v10→v11 migration
+        repo = SqliteRepo(db)
+        try:
+            row = repo._conn.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            assert row[0] == "11"
+
+            # Verify raw_size is populated for chunks
+            row1 = repo._conn.execute(
+                "SELECT raw_size FROM chunks WHERE rowid = ?", (chunk1_rowid,)
+            ).fetchone()
+            assert row1[0] == len(chunk1_data)
+
+            row2 = repo._conn.execute(
+                "SELECT raw_size FROM chunks WHERE rowid = ?", (chunk2_rowid,)
+            ).fetchone()
+            assert row2[0] == len(chunk2_data)
+
+            # Verify data roundtrip
+            type_num, data = repo.object_store.get_raw(
+                ("deadbeef" * 5).encode("ascii")
+            )
+            assert type_num == 3
+            assert data == chunk1_data + chunk2_data
+
+            # Verify range read works on migrated data
+            type_num, ranged = repo.object_store.get_raw_range(
+                ("deadbeef" * 5).encode("ascii"), 0, len(chunk1_data)
+            )
+            assert ranged == chunk1_data
+        finally:
+            repo.close()
+
+    def test_raw_size_set_on_new_chunks(self, tmp_path):
+        """Verify raw_size is set when inserting new chunks."""
+        db = str(tmp_path / "rawsize.db")
+        repo = SqliteRepo.init_bare(db)
+        try:
+            data = _large_text("rawsize_test", n=500)
+            blob = Blob.from_string(data)
+            repo.object_store.add_object(blob)
+
+            # All chunks should have raw_size set
+            rows = repo._conn.execute(
+                "SELECT raw_size FROM chunks"
+            ).fetchall()
+            assert len(rows) > 0
+            for (raw_size,) in rows:
+                assert raw_size is not None
+                assert raw_size > 0
         finally:
             repo.close()

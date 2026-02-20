@@ -39,10 +39,10 @@ For blobs >= 4096 bytes that produce multiple chunks:
 
 1. For each chunk, insert into the chunk store (dedup via `INSERT OR IGNORE`), then get its rowid:
    ```sql
-   INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) VALUES (?, ?, ?)
+   INSERT OR IGNORE INTO chunks (chunk_sha, data, compression, raw_size) VALUES (?, ?, ?, ?)
    SELECT rowid FROM chunks WHERE chunk_sha = ?
    ```
-   Where `chunk_sha` is a 32-byte binary SHA-256 digest.
+   Where `chunk_sha` is a 32-byte binary SHA-256 digest and `raw_size` is the decompressed chunk size in bytes.
 
 2. Pack all chunk rowids into a delta-zigzag-varint blob:
    ```python
@@ -73,6 +73,36 @@ Use `pack_chunk_refs()` / `unpack_chunk_refs()` from `dulwich_sqlite.object_stor
 Object SHAs are stored as 20-byte binary BLOBs (SHA-1) instead of 40-character hex TEXT. Chunk SHAs are stored as 32-byte binary BLOBs (SHA-256) instead of 64-character hex TEXT. This halves storage for both data and indices.
 
 Generated virtual columns `sha_hex` and `chunk_sha_hex` provide lowercase hex representations for human-readable SQL queries without storage overhead.
+
+## Byte Range Access
+
+The `get_raw_range(name, offset, length)` method reads a byte range from an object without reassembling the entire blob. This is efficient for large chunked objects where only a small portion is needed.
+
+### How It Works
+
+Each chunk stores its decompressed size in the `raw_size` column. This enables computing cumulative byte offsets without decompressing:
+
+```
+chunk_refs: [rowid_0, rowid_1, rowid_2, ...]
+raw_sizes:  [size_0,  size_1,  size_2,  ...]
+cumulative: [0, size_0, size_0+size_1, size_0+size_1+size_2, ...]
+
+Request: offset=5000, length=100
+  -> find first chunk where cumulative[i+1] > 5000
+  -> find last chunk where cumulative[i] < 5100
+  -> fetch + decompress only those chunks
+  -> slice the assembled range relative to first chunk's start
+```
+
+For a typical p99 chunk of ~4 KB, a range read touching one chunk uses ~4 KB of memory instead of the full object size (up to 1.7 MB).
+
+### Inline Objects
+
+For inline objects (data stored directly in the `objects` table), the full data is decompressed and sliced. This is acceptable because inline objects are small by definition (< 4 KB or single-chunk blobs).
+
+### Clamping
+
+The method clamps to object bounds: if `offset + length` exceeds the total size, available data is returned. If `offset` is past the end, empty bytes are returned.
 
 ## Chunking Algorithms
 

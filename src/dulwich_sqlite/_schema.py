@@ -3,7 +3,7 @@
 import sqlite3
 import struct
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -38,6 +38,7 @@ CREATE_TABLES = [
         chunk_sha BLOB PRIMARY KEY NOT NULL,
         data BLOB NOT NULL,
         compression TEXT NOT NULL DEFAULT 'none',
+        raw_size INTEGER,
         chunk_sha_hex TEXT GENERATED ALWAYS AS (lower(hex(chunk_sha))) VIRTUAL,
         stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
     )
@@ -455,5 +456,70 @@ def migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
     # 3. Update schema version
     conn.execute(
         "UPDATE metadata SET value = '10' WHERE key = 'schema_version'",
+    )
+    conn.commit()
+
+
+def migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+    """Migrate a v10 database to v11 schema.
+
+    Adds raw_size column to chunks table to enable efficient byte range reads.
+    Backfills raw_size for all existing chunks (uncompressed: length(data),
+    compressed: decompress and measure).
+    """
+    conn.execute("ALTER TABLE chunks ADD COLUMN raw_size INTEGER")
+
+    # Backfill uncompressed chunks via SQL
+    conn.execute(
+        "UPDATE chunks SET raw_size = length(data) WHERE compression = 'none'"
+    )
+
+    # Backfill compressed chunks via Python-side decompression
+    rows = conn.execute(
+        "SELECT rowid, data, compression FROM chunks WHERE compression != 'none'"
+    ).fetchall()
+    if rows:
+        import zlib
+
+        # Load zstd dicts from named_files if needed
+        zstd_dicts_by_id: dict[int, object] = {}
+        has_zstd = any(r[2] == "zstd" for r in rows)
+        if has_zstd:
+            import zstandard
+
+            for path in (
+                "_zstd_dict_commit",
+                "_zstd_dict_tree",
+                "_zstd_dict_chunk",
+                "_zstd_dict",
+            ):
+                dict_row = conn.execute(
+                    "SELECT contents FROM named_files WHERE path = ?", (path,)
+                ).fetchone()
+                if dict_row is not None:
+                    d = zstandard.ZstdCompressionDict(bytes(dict_row[0]))
+                    zstd_dicts_by_id[d.dict_id()] = d
+
+        for rowid, data, compression in rows:
+            raw_data = bytes(data)
+            if compression == "zlib":
+                raw_data = zlib.decompress(raw_data)
+            elif compression == "zstd":
+                import zstandard
+
+                params = zstandard.get_frame_parameters(raw_data)
+                dict_data = zstd_dicts_by_id.get(params.dict_id)
+                if dict_data is not None:
+                    dctx = zstandard.ZstdDecompressor(dict_data=dict_data)
+                else:
+                    dctx = zstandard.ZstdDecompressor()
+                raw_data = dctx.decompress(raw_data)
+            conn.execute(
+                "UPDATE chunks SET raw_size = ? WHERE rowid = ?",
+                (len(raw_data), rowid),
+            )
+
+    conn.execute(
+        "UPDATE metadata SET value = '11' WHERE key = 'schema_version'",
     )
     conn.commit()

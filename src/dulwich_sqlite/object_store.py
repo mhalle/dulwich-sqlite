@@ -203,6 +203,100 @@ class SqliteObjectStore(PackCapableObjectStore):
         parts = [self._decompress(bytes(by_rowid[rid][0]), by_rowid[rid][1]) for rid in rowids]
         return type_num, b"".join(parts)
 
+    def get_raw_range(
+        self,
+        name: RawObjectID | ObjectID,
+        offset: int,
+        length: int,
+    ) -> tuple[int, bytes]:
+        """Return a byte range of an object's raw data.
+
+        For chunked objects, only the chunks overlapping the requested range
+        are fetched and decompressed.  For inline objects the full data is
+        decompressed and sliced (they are small by definition).
+
+        Args:
+            name: Object SHA (hex or binary).
+            offset: Byte offset into the raw data.
+            length: Number of bytes to read.
+
+        Returns:
+            ``(type_num, data_slice)`` — same shape as ``get_raw()``.
+            Clamps to object bounds: returns available data if the range
+            extends past the end, or empty bytes if offset is past the end.
+
+        Raises:
+            KeyError: If the object does not exist.
+        """
+        dbsha = self._to_dbsha(name)
+        row = self._conn.execute(
+            "SELECT type_num, data, compression, chunk_refs, total_size FROM objects WHERE sha = ?",
+            (dbsha,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(self._to_hexsha(name))
+        type_num, data, compression, chunk_refs, total_size = row
+
+        # Inline object — decompress full data and slice
+        if data is not None:
+            raw = self._decompress(bytes(data), compression)
+            return type_num, raw[offset : offset + length]
+
+        # Chunked object — use raw_size to identify overlapping chunks
+        rowids = unpack_chunk_refs(bytes(chunk_refs))
+        n = len(rowids)
+        if n == 0 or offset >= (total_size or 0):
+            return type_num, b""
+
+        # Fetch raw_size for each chunk
+        placeholders = ",".join("?" * n)
+        size_rows = self._conn.execute(
+            f"SELECT rowid, raw_size FROM chunks WHERE rowid IN ({placeholders})",
+            rowids,
+        ).fetchall()
+        size_by_rowid = {r[0]: r[1] for r in size_rows}
+
+        # Build cumulative offset array
+        cumulative = [0]
+        for rid in rowids:
+            cumulative.append(cumulative[-1] + size_by_rowid[rid])
+
+        # Find overlapping chunks
+        end = min(offset + length, cumulative[-1])
+        if offset >= end:
+            return type_num, b""
+
+        first_chunk = 0
+        for i in range(n):
+            if cumulative[i + 1] > offset:
+                first_chunk = i
+                break
+
+        last_chunk = first_chunk
+        for i in range(first_chunk, n):
+            last_chunk = i
+            if cumulative[i + 1] >= end:
+                break
+
+        # Fetch and decompress only the overlapping chunks
+        needed_rowids = rowids[first_chunk : last_chunk + 1]
+        needed_placeholders = ",".join("?" * len(needed_rowids))
+        chunk_rows = self._conn.execute(
+            f"SELECT rowid, data, compression FROM chunks WHERE rowid IN ({needed_placeholders})",
+            needed_rowids,
+        ).fetchall()
+        by_rowid = {r[0]: (r[1], r[2]) for r in chunk_rows}
+
+        parts = []
+        for rid in needed_rowids:
+            parts.append(self._decompress(bytes(by_rowid[rid][0]), by_rowid[rid][1]))
+        assembled = b"".join(parts)
+
+        # Slice relative to first chunk's start
+        slice_start = offset - cumulative[first_chunk]
+        slice_end = slice_start + (end - offset)
+        return type_num, assembled[slice_start:slice_end]
+
     def _insert_object(self, obj: ShaFile) -> None:
         """Insert a single object without committing the transaction."""
         sha_bin = bytes.fromhex(obj.id.decode("ascii"))
@@ -217,9 +311,9 @@ class SqliteObjectStore(PackCapableObjectStore):
             for chunk_sha_bin, chunk_data in chunks:
                 stored_data = self._compress(chunk_data, dict_key='chunk')
                 self._conn.execute(
-                    "INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) "
-                    "VALUES (?, ?, ?)",
-                    (chunk_sha_bin, stored_data, self._compression),
+                    "INSERT OR IGNORE INTO chunks (chunk_sha, data, compression, raw_size) "
+                    "VALUES (?, ?, ?, ?)",
+                    (chunk_sha_bin, stored_data, self._compression, len(chunk_data)),
                 )
                 chunk_rowid = self._conn.execute(
                     "SELECT rowid FROM chunks WHERE chunk_sha = ?",

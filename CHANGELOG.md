@@ -2,6 +2,13 @@
 
 All notable changes to dulwich-sqlite are documented in this file.
 
+## [0.6.0] — 2026-02-20
+
+### Added
+
+- **Byte range access**: New `get_raw_range(name, offset, length)` method on `SqliteObjectStore` for reading byte ranges from objects without reassembling the entire blob. For chunked objects, only the chunks overlapping the requested range are fetched and decompressed
+- **Schema v11**: Added `raw_size INTEGER` column to `chunks` table tracking decompressed chunk size. Enables computing cumulative byte offsets across chunks without decompression. Automatic migration from v10 on open (backfills raw_size for all existing chunks)
+
 ## [0.5.0] — 2026-02-19
 
 ### Changed

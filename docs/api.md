@@ -10,7 +10,7 @@
 SqliteRepo(db_path: str)
 ```
 
-Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3 through v9 databases to the current schema (v10).
+Opens an existing dulwich-sqlite repository. Applies WAL pragmas, verifies the schema version, and auto-migrates v3 through v10 databases to the current schema (v11).
 
 **Raises:** `NotGitRepository` if the file is not a valid dulwich-sqlite database or has an unsupported schema version.
 
@@ -236,6 +236,31 @@ Returns `(type_num, raw_data)`. For chunked objects, reassembles the data from c
 | 2 | tree |
 | 3 | blob |
 | 4 | tag |
+
+**Raises:** `KeyError` if the object does not exist.
+
+#### `get_raw_range`
+
+```python
+store.get_raw_range(
+    name: RawObjectID | ObjectID,
+    offset: int,
+    length: int,
+) -> tuple[int, bytes]
+```
+
+Returns `(type_num, data_slice)` for a byte range of an object's raw data. For chunked objects, only the chunks overlapping the requested range are fetched and decompressed — this is efficient for large blobs where only a small portion is needed.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | `RawObjectID \| ObjectID` | Object SHA (hex or binary) |
+| `offset` | `int` | Byte offset into the raw data |
+| `length` | `int` | Number of bytes to read |
+
+**Behavior:**
+- **Inline objects**: Full data is decompressed and sliced (inline objects are small by definition)
+- **Chunked objects**: Uses per-chunk `raw_size` to compute byte offsets, fetches only overlapping chunks
+- **Clamping**: If `offset + length` exceeds the object size, returns available data. If `offset` is past the end, returns empty bytes
 
 **Raises:** `KeyError` if the object does not exist.
 

@@ -4,7 +4,7 @@ dulwich-sqlite stores all repository data in a single SQLite database. This docu
 
 ## Schema Version
 
-The current schema version is **10**. The version is stored in the `metadata` table under the key `schema_version`.
+The current schema version is **11**. The version is stored in the `metadata` table under the key `schema_version`.
 
 ### Version History
 
@@ -18,8 +18,9 @@ The current schema version is **10**. The version is stored in the `metadata` ta
 | v8 | Inline object compression: added `compression` column to `objects` table. Changed `size_bytes` to use `total_size` (always set). Inline objects (commits, trees, tags, small blobs) are now compressed when compression is enabled |
 | v9 | Inline chunk lists: replaced `object_chunks` table with `chunk_refs BLOB` column on `objects`. Packed little-endian 8-byte rowids eliminate the join table entirely |
 | v10 | Binary SHAs + delta-varint chunk_refs: `objects.sha` changed from TEXT(40) to BLOB(20), `chunks.chunk_sha` from TEXT(64) to BLOB(32). Added `sha_hex`/`chunk_sha_hex` generated columns. `chunk_refs` re-encoded from fixed 8-byte LE to delta-zigzag-varint (~81% smaller) |
+| v11 | Byte range access: added `raw_size INTEGER` column to `chunks` table tracking decompressed chunk size. Enables efficient range reads without decompressing all chunks |
 
-Migration from v3 through v9 happens automatically when opening a database with `SqliteRepo()`.
+Migration from v3 through v10 happens automatically when opening a database with `SqliteRepo()`.
 
 ## Pragmas
 
@@ -96,6 +97,7 @@ CREATE TABLE chunks (
     chunk_sha BLOB PRIMARY KEY NOT NULL,
     data BLOB NOT NULL,
     compression TEXT NOT NULL DEFAULT 'none',
+    raw_size INTEGER,
     chunk_sha_hex TEXT GENERATED ALWAYS AS (lower(hex(chunk_sha))) VIRTUAL,
     stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
 );
@@ -106,6 +108,7 @@ CREATE TABLE chunks (
 | `chunk_sha` | BLOB PK | 32-byte binary SHA-256 digest of the **raw** (uncompressed) chunk data |
 | `data` | BLOB | Chunk data, possibly compressed |
 | `compression` | TEXT | Compression method: `'none'`, `'zlib'`, or `'zstd'` |
+| `raw_size` | INTEGER | Decompressed size of the chunk data in bytes. Used for byte range offset calculation |
 | `chunk_sha_hex` | TEXT (generated) | Lowercase hex encoding of `chunk_sha` for human-readable queries |
 | `stored_size` | INTEGER (generated) | On-disk size of the stored data in bytes (may differ from raw size if compressed) |
 
@@ -320,3 +323,14 @@ Binary SHAs and delta-varint chunk_refs:
 3. Schema version updated to `"10"`
 
 Binary SHAs halve storage for both SHA columns and their indices. Delta-varint encoding reduces `chunk_refs` by ~81% — consecutive chunk rowids (delta=1) encode to a single byte instead of 8. Combined savings: ~15 MB for a typical large repository.
+
+### v10 to v11
+
+Added `raw_size` column for byte range access:
+
+1. `raw_size INTEGER` column added to `chunks` via `ALTER TABLE`
+2. Backfill for uncompressed chunks: `UPDATE chunks SET raw_size = length(data) WHERE compression = 'none'`
+3. Backfill for compressed chunks: Python-side decompression to measure raw size (loads zstd dicts from `named_files` if needed)
+4. Schema version updated to `"11"`
+
+The `raw_size` column enables efficient byte range reads by computing cumulative byte offsets across chunks without decompressing. Storage overhead is minimal (~4 bytes per chunk row).
