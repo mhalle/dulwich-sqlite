@@ -4,7 +4,7 @@ dulwich-sqlite stores all repository data in a single SQLite database. This docu
 
 ## Schema Version
 
-The current schema version is **8**. The version is stored in the `metadata` table under the key `schema_version`.
+The current schema version is **9**. The version is stored in the `metadata` table under the key `schema_version`.
 
 ### Version History
 
@@ -16,8 +16,9 @@ The current schema version is **8**. The version is stored in the `metadata` tab
 | v6 | Added convenience generated columns: `objects.is_chunked`, `chunks.stored_size`, `reflog.old_sha_text`, `reflog.new_sha_text`, `reflog.committer_text`, `reflog.datetime_text` |
 | v7 | Integer keys in `object_chunks`: replaced `object_sha`/`chunk_sha` text columns with `object_id`/`chunk_id` integer rowid references. Added zstd compression support |
 | v8 | Inline object compression: added `compression` column to `objects` table. Changed `size_bytes` to use `total_size` (always set). Inline objects (commits, trees, tags, small blobs) are now compressed when compression is enabled |
+| v9 | Inline chunk lists: replaced `object_chunks` table with `chunk_refs BLOB` column on `objects`. Packed little-endian 8-byte rowids eliminate the join table entirely |
 
-Migration from v3 through v7 happens automatically when opening a database with `SqliteRepo()`.
+Migration from v3 through v8 happens automatically when opening a database with `SqliteRepo()`.
 
 ## Pragmas
 
@@ -46,6 +47,7 @@ CREATE TABLE objects (
     sha TEXT PRIMARY KEY NOT NULL,
     type_num INTEGER NOT NULL,
     data BLOB,
+    chunk_refs BLOB,
     total_size INTEGER,
     compression TEXT NOT NULL DEFAULT 'none',
     type_name TEXT GENERATED ALWAYS AS (
@@ -66,6 +68,7 @@ CREATE TABLE objects (
 | `sha` | TEXT PK | Hex-encoded SHA-1 of the Git object |
 | `type_num` | INTEGER | Git object type: 1=commit, 2=tree, 3=blob, 4=tag |
 | `data` | BLOB (nullable) | Object data, possibly compressed. NULL for chunked blobs (data is in the `chunks` table) |
+| `chunk_refs` | BLOB (nullable) | Packed chunk rowids for chunked objects. NULL for inline objects. Little-endian 8-byte unsigned integers (`struct.pack('<NQ', ...)`). Length / 8 = chunk count |
 | `total_size` | INTEGER | Total raw (uncompressed) data size in bytes. Always set for both inline and chunked objects |
 | `compression` | TEXT | Compression method for inline data: `'none'`, `'zlib'`, or `'zstd'`. Always `'none'` for chunked objects (their chunks have their own compression) |
 | `type_name` | TEXT (generated) | Human-readable type name derived from `type_num` |
@@ -73,11 +76,12 @@ CREATE TABLE objects (
 | `is_chunked` | INTEGER (generated) | 1 if the object is chunked (data is NULL), 0 if inline |
 
 **Notes:**
-- Inline objects have `data` populated and `total_size` set to the raw data size
-- Chunked objects have `data` as NULL and `total_size` set to the total reassembled size
+- Inline objects have `data` populated, `chunk_refs` as NULL, and `total_size` set to the raw data size
+- Chunked objects have `data` as NULL, `chunk_refs` packed with ordered chunk rowids, and `total_size` set to the total reassembled size
 - Non-blob objects (commits, trees, tags) are always stored inline
 - Only blobs >= 4096 bytes that produce multiple chunks are stored in chunked form
 - When compression is enabled, inline data is compressed; decompress using the `compression` column value
+- The `chunk_refs` blob is opaque binary — use the Python API or `struct` to unpack the rowids
 
 ### `chunks`
 
@@ -103,33 +107,6 @@ CREATE TABLE chunks (
 - The SHA-256 key is always computed on raw data, regardless of whether the stored data is compressed. This ensures deduplication works across compression modes
 - Chunks are inserted with `INSERT OR IGNORE`, so if two objects share the same chunk, only the first copy is stored
 - A single database can have a mix of `'none'`, `'zlib'`, and `'zstd'` chunks
-
-### `object_chunks`
-
-Maps objects to their ordered sequence of chunks via integer rowid references.
-
-```sql
-CREATE TABLE object_chunks (
-    object_id INTEGER NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    chunk_id INTEGER NOT NULL,
-    PRIMARY KEY (object_id, chunk_index)
-);
-
-CREATE INDEX idx_object_chunks_chunk ON object_chunks (chunk_id);
-```
-
-| Column | Type | Description |
-|---|---|---|
-| `object_id` | INTEGER | rowid of the Git object in the `objects` table |
-| `chunk_index` | INTEGER | 0-based position of this chunk in the object's data |
-| `chunk_id` | INTEGER | rowid of the chunk in the `chunks` table |
-
-**Notes:**
-- To reassemble a chunked object, join `object_chunks` with `chunks` on `chunk_id = chunks.rowid`, ordered by `chunk_index`, and concatenate the chunk data
-- To resolve the object SHA, join with `objects` on `object_id = objects.rowid`
-- The index on `chunk_id` supports reverse lookups (finding all objects that share a chunk)
-- Integer keys reduce storage overhead significantly compared to the text SHA columns used in schema v6 and earlier
 
 ### `refs`
 
@@ -206,7 +183,7 @@ CREATE TABLE metadata (
 
 | Key | Values | Description |
 |---|---|---|
-| `schema_version` | `"3"` through `"8"` | Current schema version |
+| `schema_version` | `"3"` through `"9"` | Current schema version |
 | `compression` | `"none"`, `"zlib"`, `"zstd"` | Current compression setting for new chunks |
 
 ### `reflog`
@@ -295,15 +272,13 @@ All columns are VIRTUAL (computed on read, no storage overhead).
 
 ### v6 to v7
 
-Replaced text SHA columns in `object_chunks` with integer rowid references:
+Replaced text SHA columns in `object_chunks` with integer rowid references (intermediate step, table removed in v9):
 
 1. New `object_chunks_new` table created with `(object_id INTEGER, chunk_index INTEGER, chunk_id INTEGER)` schema
 2. Data migrated via `INSERT INTO object_chunks_new SELECT o.rowid, oc.chunk_index, c.rowid FROM object_chunks oc JOIN objects o ON o.sha = oc.object_sha JOIN chunks c ON c.chunk_sha = oc.chunk_sha`
 3. Old index and table dropped, new table renamed to `object_chunks`
 4. New index created on `chunk_id`
 5. Schema version updated to `"7"`
-
-This migration significantly reduces `object_chunks` storage overhead by replacing 40+ byte text SHA columns with ~3 byte integer rowid references.
 
 ### v7 to v8
 
@@ -316,3 +291,15 @@ Added inline object compression:
 5. Schema version updated to `"8"`
 
 The table recreation is needed because SQLite cannot alter generated column expressions in place. The `size_bytes` column now uses `total_size` because inline data may be compressed, so `length(data)` would return the compressed size rather than the original size.
+
+### v8 to v9
+
+Replaced the `object_chunks` join table with inline `chunk_refs` BLOB:
+
+1. `chunk_refs BLOB` column added to `objects` via `ALTER TABLE`
+2. All `object_chunks` rows fetched ordered by `(object_id, chunk_index)`, grouped by `object_id`, chunk rowids packed as little-endian 8-byte unsigned integers, and written to each object's `chunk_refs`
+3. `idx_object_chunks_chunk` index dropped
+4. `object_chunks` table dropped
+5. Schema version updated to `"9"`
+
+This eliminates the `object_chunks` table entirely (~45% of database size for large repos), replacing it with a compact binary blob on each chunked object row. The packed format uses `struct.pack('<NQ', ...)` — length / 8 = chunk count.

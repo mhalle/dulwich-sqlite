@@ -119,14 +119,16 @@ class TestDeduplication:
         assert data2 == shared + unique2
 
         # Count chunk references vs unique chunks
-        ref_count = store._conn.execute(
-            "SELECT COUNT(*) FROM object_chunks"
-        ).fetchone()[0]
+        total_refs = 0
+        for row in store._conn.execute(
+            "SELECT chunk_refs FROM objects WHERE chunk_refs IS NOT NULL"
+        ).fetchall():
+            total_refs += len(bytes(row[0])) // 8
         unique_chunks = store._conn.execute(
             "SELECT COUNT(*) FROM chunks"
         ).fetchone()[0]
         # Should have some dedup: unique chunks < total references
-        assert unique_chunks < ref_count
+        assert unique_chunks < total_refs
 
     def test_replace_semantics(self, store):
         """Adding the same object twice should work cleanly."""
@@ -226,11 +228,11 @@ class TestMigration:
         # Open with SqliteRepo — should trigger migration
         repo = SqliteRepo(db)
         try:
-            # Verify version is now 7 (v3→v4→v5→v6→v7 chain)
+            # Verify version is now 9 (v3→v4→...→v9 chain)
             row = repo._conn.execute(
                 "SELECT value FROM metadata WHERE key = 'schema_version'"
             ).fetchone()
-            assert row[0] == "8"
+            assert row[0] == "9"
 
             # Verify old data is still accessible
             row = repo._conn.execute(
@@ -239,9 +241,21 @@ class TestMigration:
             ).fetchone()
             assert bytes(row[0]) == b"test data"
 
-            # Verify new tables exist
+            # Verify chunks table exists but object_chunks is gone
             repo._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
-            repo._conn.execute("SELECT COUNT(*) FROM object_chunks").fetchone()
+            tables = [
+                r[0] for r in repo._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            ]
+            assert "object_chunks" not in tables
+
+            # Verify chunk_refs column works
+            row = repo._conn.execute(
+                "SELECT chunk_refs FROM objects WHERE sha = ?",
+                ("abcd" * 10,),
+            ).fetchone()
+            assert row[0] is None  # inline object has no chunk_refs
         finally:
             repo.close()
 

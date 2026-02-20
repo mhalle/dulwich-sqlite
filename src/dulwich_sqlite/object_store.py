@@ -1,6 +1,7 @@
 """SQLite-backed object store for Dulwich."""
 
 import sqlite3
+import struct
 import zlib
 from collections.abc import Callable, Iterable, Iterator
 from typing import BinaryIO, cast
@@ -113,24 +114,25 @@ class SqliteObjectStore(PackCapableObjectStore):
     def get_raw(self, name: RawObjectID | ObjectID) -> tuple[int, bytes]:
         hexsha = self._to_hexsha(name)
         row = self._conn.execute(
-            "SELECT rowid, type_num, data, compression FROM objects WHERE sha = ?",
+            "SELECT type_num, data, compression, chunk_refs FROM objects WHERE sha = ?",
             (hexsha.decode("ascii"),),
         ).fetchone()
         if row is None:
             raise KeyError(hexsha)
-        obj_rowid, type_num, data, compression = row
+        type_num, data, compression, chunk_refs = row
         if data is not None:
             return type_num, self._decompress(bytes(data), compression)
-        # Reassemble from chunks
+        # Reassemble from chunks using packed rowids
+        chunk_refs = bytes(chunk_refs)
+        n = len(chunk_refs) // 8
+        rowids = struct.unpack(f'<{n}Q', chunk_refs)
+        placeholders = ','.join('?' * n)
         chunk_rows = self._conn.execute(
-            "SELECT c.data, c.compression FROM object_chunks oc "
-            "JOIN chunks c ON c.rowid = oc.chunk_id "
-            "WHERE oc.object_id = ? ORDER BY oc.chunk_index",
-            (obj_rowid,),
+            f"SELECT rowid, data, compression FROM chunks WHERE rowid IN ({placeholders})",
+            rowids,
         ).fetchall()
-        parts = []
-        for data, compression in chunk_rows:
-            parts.append(self._decompress(bytes(data), compression))
+        by_rowid = {r[0]: (r[1], r[2]) for r in chunk_rows}
+        parts = [self._decompress(bytes(by_rowid[rid][0]), by_rowid[rid][1]) for rid in rowids]
         return type_num, b"".join(parts)
 
     def _insert_object(self, obj: ShaFile) -> None:
@@ -143,22 +145,8 @@ class SqliteObjectStore(PackCapableObjectStore):
             chunks = chunk_blob(raw_data)
 
         if chunks is not None:
-            # Insert or replace the object row first
-            self._conn.execute(
-                "INSERT OR REPLACE INTO objects (sha, type_num, data, total_size, compression) "
-                "VALUES (?, ?, NULL, ?, 'none')",
-                (sha_str, obj.type_num, len(raw_data)),
-            )
-            obj_rowid = self._conn.execute(
-                "SELECT rowid FROM objects WHERE sha = ?",
-                (sha_str,),
-            ).fetchone()[0]
-            # Clear any existing chunk mappings for REPLACE semantics
-            self._conn.execute(
-                "DELETE FROM object_chunks WHERE object_id = ?",
-                (obj_rowid,),
-            )
-            for idx, (chunk_sha, chunk_data) in enumerate(chunks):
+            chunk_rowids = []
+            for chunk_sha, chunk_data in chunks:
                 stored_data = self._compress(chunk_data)
                 self._conn.execute(
                     "INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) "
@@ -169,17 +157,19 @@ class SqliteObjectStore(PackCapableObjectStore):
                     "SELECT rowid FROM chunks WHERE chunk_sha = ?",
                     (chunk_sha,),
                 ).fetchone()[0]
-                self._conn.execute(
-                    "INSERT INTO object_chunks (object_id, chunk_index, chunk_id) "
-                    "VALUES (?, ?, ?)",
-                    (obj_rowid, idx, chunk_rowid),
-                )
+                chunk_rowids.append(chunk_rowid)
+            packed = struct.pack(f'<{len(chunk_rowids)}Q', *chunk_rowids)
+            self._conn.execute(
+                "INSERT OR REPLACE INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
+                "VALUES (?, ?, NULL, ?, ?, 'none')",
+                (sha_str, obj.type_num, packed, len(raw_data)),
+            )
         else:
             # Inline storage
             stored_data = self._compress(raw_data)
             self._conn.execute(
-                "INSERT OR REPLACE INTO objects (sha, type_num, data, total_size, compression) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
                 (sha_str, obj.type_num, stored_data, len(raw_data), self._compression),
             )
 
@@ -276,34 +266,18 @@ class SqliteObjectStore(PackCapableObjectStore):
             limit: Maximum number of results to return.
         """
         results: set[str] = set()
+        query_bytes = query.encode("utf-8", errors="surrogateescape")
 
-        # 1. SQL LIKE on uncompressed chunks + uncompressed inline blobs
-        sql = """
-            SELECT DISTINCT o.sha FROM chunks c
-            JOIN object_chunks oc ON c.rowid = oc.chunk_id
-            JOIN objects o ON o.rowid = oc.object_id
-            WHERE c.compression = 'none' AND CAST(c.data AS TEXT) LIKE ?
-            UNION
-            SELECT sha FROM objects
-            WHERE data IS NOT NULL AND type_num = 3 AND compression = 'none'
-              AND CAST(data AS TEXT) LIKE ?
-        """
-        for row in self._conn.execute(sql, [f"%{query}%", f"%{query}%"]).fetchall():
+        # 1. SQL LIKE on uncompressed inline blobs
+        for row in self._conn.execute(
+            "SELECT sha FROM objects "
+            "WHERE data IS NOT NULL AND type_num = 3 AND compression = 'none' "
+            "AND CAST(data AS TEXT) LIKE ?",
+            (f"%{query}%",),
+        ).fetchall():
             results.add(row[0])
 
-        # 2. Python-side search on compressed chunks
-        query_bytes = query.encode("utf-8", errors="surrogateescape")
-        for row in self._conn.execute(
-            "SELECT DISTINCT o.sha, c.data, c.compression FROM chunks c "
-            "JOIN object_chunks oc ON c.rowid = oc.chunk_id "
-            "JOIN objects o ON o.rowid = oc.object_id "
-            "WHERE c.compression != 'none'"
-        ).fetchall():
-            if row[0] not in results:
-                if query_bytes in self._decompress(bytes(row[1]), row[2]):
-                    results.add(row[0])
-
-        # 3. Python-side search on compressed inline blobs
+        # 2. Python-side search on compressed inline blobs
         for row in self._conn.execute(
             "SELECT sha, data, compression FROM objects "
             "WHERE data IS NOT NULL AND type_num = 3 AND compression != 'none'"
@@ -311,6 +285,34 @@ class SqliteObjectStore(PackCapableObjectStore):
             if row[0] not in results:
                 if query_bytes in self._decompress(bytes(row[1]), row[2]):
                     results.add(row[0])
+
+        # 3. Find matching chunk rowids (uncompressed via SQL, compressed via Python)
+        matching_chunk_rowids: set[int] = set()
+        for row in self._conn.execute(
+            "SELECT rowid FROM chunks "
+            "WHERE compression = 'none' AND CAST(data AS TEXT) LIKE ?",
+            (f"%{query}%",),
+        ).fetchall():
+            matching_chunk_rowids.add(row[0])
+
+        for row in self._conn.execute(
+            "SELECT rowid, data, compression FROM chunks WHERE compression != 'none'"
+        ).fetchall():
+            if query_bytes in self._decompress(bytes(row[1]), row[2]):
+                matching_chunk_rowids.add(row[0])
+
+        # 4. Scan chunked objects' chunk_refs blobs for matching rowids
+        if matching_chunk_rowids:
+            for row in self._conn.execute(
+                "SELECT sha, chunk_refs FROM objects "
+                "WHERE chunk_refs IS NOT NULL AND type_num = 3"
+            ).fetchall():
+                if row[0] not in results:
+                    refs_blob = bytes(row[1])
+                    n = len(refs_blob) // 8
+                    rowids = set(struct.unpack(f'<{n}Q', refs_blob))
+                    if rowids & matching_chunk_rowids:
+                        results.add(row[0])
 
         out = list(results)
         if limit is not None:

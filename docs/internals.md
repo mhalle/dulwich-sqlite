@@ -37,27 +37,21 @@ The object data goes in the `data` column (compressed if compression is enabled)
 
 For blobs >= 4096 bytes that produce multiple chunks:
 
-1. Insert the object row with NULL data:
-   ```sql
-   INSERT OR REPLACE INTO objects (sha, type_num, data, total_size, compression)
-   VALUES (?, ?, NULL, ?, 'none')
-   ```
-
-2. Get the object's rowid and clear any existing chunk mappings (for `REPLACE` semantics):
-   ```sql
-   SELECT rowid FROM objects WHERE sha = ?
-   DELETE FROM object_chunks WHERE object_id = ?
-   ```
-
-3. For each chunk, insert into the chunk store (dedup via `INSERT OR IGNORE`), then get its rowid:
+1. For each chunk, insert into the chunk store (dedup via `INSERT OR IGNORE`), then get its rowid:
    ```sql
    INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) VALUES (?, ?, ?)
    SELECT rowid FROM chunks WHERE chunk_sha = ?
    ```
 
-4. Record the chunk ordering with integer keys:
+2. Pack all chunk rowids into a binary blob (little-endian 8-byte unsigned integers):
+   ```python
+   packed = struct.pack(f'<{len(chunk_rowids)}Q', *chunk_rowids)
+   ```
+
+3. Insert the object row with NULL data and the packed chunk_refs:
    ```sql
-   INSERT INTO object_chunks (object_id, chunk_index, chunk_id) VALUES (?, ?, ?)
+   INSERT OR REPLACE INTO objects (sha, type_num, data, chunk_refs, total_size, compression)
+   VALUES (?, ?, NULL, ?, ?, 'none')
    ```
 
 ## Chunking Algorithms
@@ -120,10 +114,10 @@ INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) VALUES (?, ?, ?)
 If a chunk with that SHA-256 already exists, the insert is silently skipped. This means:
 
 - The first blob to introduce a chunk stores it
-- Subsequent blobs reference the same chunk row
+- Subsequent blobs reference the same chunk row via their `chunk_refs` blob
 - No extra logic needed — SQLite's constraint handling does the dedup
 
-The `object_chunks` table is a many-to-many mapping: multiple objects can reference the same chunk.
+Multiple objects can reference the same chunk rowid in their `chunk_refs` blobs.
 
 ### SHA-256 on Raw Data
 

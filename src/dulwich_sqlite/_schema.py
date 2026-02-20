@@ -1,8 +1,9 @@
 """SQLite schema definitions for dulwich-sqlite."""
 
 import sqlite3
+import struct
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "9"
 
 PRAGMAS = [
     "PRAGMA journal_mode=WAL",
@@ -16,6 +17,7 @@ CREATE_TABLES = [
         sha TEXT PRIMARY KEY NOT NULL,
         type_num INTEGER NOT NULL,
         data BLOB,
+        chunk_refs BLOB,
         total_size INTEGER,
         compression TEXT NOT NULL DEFAULT 'none',
         type_name TEXT GENERATED ALWAYS AS (
@@ -38,15 +40,6 @@ CREATE_TABLES = [
         stored_size INTEGER GENERATED ALWAYS AS (length(data)) VIRTUAL
     )
     """,
-    """
-    CREATE TABLE IF NOT EXISTS object_chunks (
-        object_id INTEGER NOT NULL,
-        chunk_index INTEGER NOT NULL,
-        chunk_id INTEGER NOT NULL,
-        PRIMARY KEY (object_id, chunk_index)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_object_chunks_chunk ON object_chunks (chunk_id)",
     """
     CREATE TABLE IF NOT EXISTS refs (
         name BLOB PRIMARY KEY NOT NULL,
@@ -331,5 +324,49 @@ def migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE _objects_v7")
     conn.execute(
         "UPDATE metadata SET value = '8' WHERE key = 'schema_version'",
+    )
+    conn.commit()
+
+
+def migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """Migrate a v8 database to v9 schema.
+
+    Replaces the object_chunks table with a packed chunk_refs BLOB column
+    on the objects table. Each chunked object stores its ordered chunk rowids
+    as little-endian 8-byte unsigned integers.
+    """
+    conn.execute("ALTER TABLE objects ADD COLUMN chunk_refs BLOB")
+
+    # Fetch all object_chunks rows grouped by object_id, ordered by chunk_index
+    rows = conn.execute(
+        "SELECT object_id, chunk_id FROM object_chunks ORDER BY object_id, chunk_index"
+    ).fetchall()
+
+    # Group by object_id and pack chunk_ids
+    if rows:
+        current_obj = rows[0][0]
+        chunk_ids: list[int] = []
+        for obj_id, chunk_id in rows:
+            if obj_id != current_obj:
+                packed = struct.pack(f'<{len(chunk_ids)}Q', *chunk_ids)
+                conn.execute(
+                    "UPDATE objects SET chunk_refs = ? WHERE rowid = ?",
+                    (packed, current_obj),
+                )
+                current_obj = obj_id
+                chunk_ids = []
+            chunk_ids.append(chunk_id)
+        # Flush last group
+        if chunk_ids:
+            packed = struct.pack(f'<{len(chunk_ids)}Q', *chunk_ids)
+            conn.execute(
+                "UPDATE objects SET chunk_refs = ? WHERE rowid = ?",
+                (packed, current_obj),
+            )
+
+    conn.execute("DROP INDEX IF EXISTS idx_object_chunks_chunk")
+    conn.execute("DROP TABLE IF EXISTS object_chunks")
+    conn.execute(
+        "UPDATE metadata SET value = '9' WHERE key = 'schema_version'",
     )
     conn.commit()

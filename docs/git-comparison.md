@@ -104,7 +104,7 @@ The `depth` parameter on `clone_from` and `fetch` fetches limited history, but d
 
 ### Orphaned Chunks
 
-When an object is replaced (via `INSERT OR REPLACE`), its old chunk mappings are deleted from `object_chunks`, but the chunks themselves remain in the `chunks` table if they were shared. Over time, chunks that are no longer referenced by any object can accumulate. There is no built-in cleanup mechanism yet.
+When a chunked object is replaced (via `INSERT OR REPLACE`), the old `chunk_refs` blob is overwritten, but the chunks themselves remain in the `chunks` table. Over time, chunks that are no longer referenced by any object's `chunk_refs` can accumulate. There is no built-in cleanup mechanism yet.
 
 ## Compression: Off vs zlib vs zstd
 

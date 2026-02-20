@@ -2,6 +2,19 @@
 
 All notable changes to dulwich-sqlite are documented in this file.
 
+## [0.4.0] — 2026-02-19
+
+### Changed
+
+- **Schema v9**: Inline chunk lists — replaced `object_chunks` join table with `chunk_refs BLOB` on the `objects` table
+  - Chunk references are packed as little-endian 8-byte unsigned integers directly on each chunked object row
+  - Eliminates the `object_chunks` table and its index entirely (~45% storage savings for chunk-heavy repos)
+  - Automatic migration from v8 on open (packs existing `object_chunks` rows, drops the table)
+  - `_insert_object()` simplified: no rowid lookup, no DELETE, just pack and INSERT OR REPLACE
+  - `get_raw()` unpacks chunk_refs and fetches chunks by rowid IN clause
+  - `search_content()` restructured to scan chunk_refs blobs for matching chunk rowids
+  - Direct SQL queries for chunk-to-object mappings are no longer available; use the Python API
+
 ## [0.3.1] — 2026-02-19
 
 ### Changed

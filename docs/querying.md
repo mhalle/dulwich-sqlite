@@ -81,77 +81,40 @@ For compressed inline blobs, use the Python API or decompress in your applicatio
 
 ### Reassembling Chunked Blobs
 
-Chunked blobs have `data IS NULL`. Reassemble by joining with the chunk tables through integer rowid references:
+Chunked blobs have `data IS NULL` and `chunk_refs` populated. The `chunk_refs` column is a packed binary blob of little-endian 8-byte unsigned integers, each being a rowid into the `chunks` table. Use the Python API to reassemble:
 
-```sql
-SELECT c.data, c.compression
-FROM object_chunks oc
-JOIN chunks c ON c.rowid = oc.chunk_id
-WHERE oc.object_id = (SELECT rowid FROM objects WHERE sha = 'abc123...')
-ORDER BY oc.chunk_index;
+```python
+import struct
+from dulwich_sqlite import SqliteRepo
+
+repo = SqliteRepo("my-repo.db")
+type_num, data = repo.object_store.get_raw(b"abc123...")
+repo.close()
 ```
 
-Each row is one chunk in order. Concatenate all chunk data to get the full blob content. If `compression` is `'zlib'` or `'zstd'`, decompress each chunk first.
+For direct SQL access to individual chunks of a chunked object, you need to unpack the `chunk_refs` blob in Python first:
 
-For uncompressed chunks, you can reassemble directly in SQL:
+```python
+import sqlite3, struct
 
-```sql
-SELECT GROUP_CONCAT(CAST(c.data AS TEXT), '') as full_content
-FROM object_chunks oc
-JOIN chunks c ON c.rowid = oc.chunk_id
-WHERE oc.object_id = (SELECT rowid FROM objects WHERE sha = 'abc123...')
-  AND c.compression = 'none'
-ORDER BY oc.chunk_index;
+conn = sqlite3.connect("my-repo.db")
+row = conn.execute(
+    "SELECT chunk_refs FROM objects WHERE sha = 'abc123...'"
+).fetchone()
+refs = bytes(row[0])
+n = len(refs) // 8
+rowids = struct.unpack(f'<{n}Q', refs)
+# Now fetch chunks by rowid
+for rid in rowids:
+    chunk = conn.execute(
+        "SELECT data, compression FROM chunks WHERE rowid = ?", (rid,)
+    ).fetchone()
+    # decompress if needed based on compression column
 ```
 
-**Note:** Since schema v7, `object_chunks` uses integer rowid references (`object_id`, `chunk_id`) instead of text SHA columns. To resolve SHAs, join through the `objects` and `chunks` tables.
+**Note:** The `chunk_refs` blob is opaque binary. SQL-only chunk reassembly is not practical — use the Python API for chunked objects.
 
 ## Chunk Queries
-
-### Chunks for a Specific Object
-
-```sql
-SELECT oc.chunk_index, c.chunk_sha, c.stored_size, c.compression
-FROM object_chunks oc
-JOIN chunks c ON c.rowid = oc.chunk_id
-WHERE oc.object_id = (SELECT rowid FROM objects WHERE sha = 'abc123...')
-ORDER BY oc.chunk_index;
-```
-
-### Objects Sharing a Chunk
-
-Find all objects that share a specific chunk (demonstrates deduplication):
-
-```sql
-SELECT o.sha
-FROM object_chunks oc
-JOIN objects o ON o.rowid = oc.object_id
-WHERE oc.chunk_id = (SELECT rowid FROM chunks WHERE chunk_sha = 'def456...');
-```
-
-### Most Shared Chunks
-
-```sql
-SELECT c.chunk_sha, COUNT(*) as shared_by
-FROM object_chunks oc
-JOIN chunks c ON c.rowid = oc.chunk_id
-GROUP BY oc.chunk_id
-HAVING shared_by > 1
-ORDER BY shared_by DESC
-LIMIT 10;
-```
-
-### Deduplication Savings
-
-Compare total chunk references to unique chunks:
-
-```sql
-SELECT
-    COUNT(*) as total_chunk_references,
-    COUNT(DISTINCT chunk_id) as unique_chunks,
-    COUNT(*) - COUNT(DISTINCT chunk_id) as duplicates_avoided
-FROM object_chunks;
-```
 
 ### Chunk Size Distribution
 
@@ -165,6 +128,29 @@ SELECT
 FROM chunks
 GROUP BY compression;
 ```
+
+### Chunked Object Statistics
+
+Count how many objects are chunked and total chunk references:
+
+```python
+import sqlite3, struct
+
+conn = sqlite3.connect("my-repo.db")
+total_refs = 0
+chunked_count = 0
+for row in conn.execute("SELECT chunk_refs FROM objects WHERE chunk_refs IS NOT NULL"):
+    chunked_count += 1
+    total_refs += len(bytes(row[0])) // 8
+
+unique_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+print(f"Chunked objects: {chunked_count}")
+print(f"Total chunk references: {total_refs}")
+print(f"Unique chunks: {unique_chunks}")
+print(f"Duplicates avoided: {total_refs - unique_chunks}")
+```
+
+**Note:** Since schema v9, chunk references are packed into the `chunk_refs` BLOB column on the `objects` table. The `object_chunks` join table no longer exists. Deduplication statistics require Python-side unpacking.
 
 ## Text Search
 
@@ -183,56 +169,9 @@ WHERE type_name = 'blob'
 
 **Note:** SQL `LIKE` only works on uncompressed inline blobs (`compression = 'none'`). Compressed inline blobs require Python-side decompression for searching.
 
-### Search Uncompressed Chunks
+### Search Using the Python API
 
-```sql
-SELECT DISTINCT o.sha
-FROM chunks c
-JOIN object_chunks oc ON c.rowid = oc.chunk_id
-JOIN objects o ON o.rowid = oc.object_id
-WHERE c.compression = 'none'
-  AND CAST(c.data AS TEXT) LIKE '%TODO%';
-```
-
-### Combined Search (Uncompressed Inline + Uncompressed Chunks)
-
-This matches what `search_content()` does for the SQL portion:
-
-```sql
-SELECT DISTINCT o.sha FROM chunks c
-JOIN object_chunks oc ON c.rowid = oc.chunk_id
-JOIN objects o ON o.rowid = oc.object_id
-WHERE c.compression = 'none' AND CAST(c.data AS TEXT) LIKE '%search_term%'
-UNION
-SELECT sha FROM objects
-WHERE NOT is_chunked AND type_name = 'blob' AND compression = 'none'
-  AND CAST(data AS TEXT) LIKE '%search_term%';
-```
-
-`search_content()` also does Python-side decompression for compressed chunks and compressed inline blobs.
-
-### Compressed Chunks
-
-Compressed chunks (`compression = 'zlib'` or `'zstd'`) cannot be searched with SQL `LIKE`. You need Python-side decompression:
-
-```python
-import sqlite3, zlib
-
-conn = sqlite3.connect("my-repo.db")
-query = b"search_term"
-
-for row in conn.execute(
-    "SELECT DISTINCT o.sha, c.data "
-    "FROM chunks c "
-    "JOIN object_chunks oc ON c.rowid = oc.chunk_id "
-    "JOIN objects o ON o.rowid = oc.object_id "
-    "WHERE c.compression = 'zlib'"
-):
-    if query in zlib.decompress(bytes(row[1])):
-        print(f"Found in object {row[0]}")
-```
-
-Or simply use the Python API which handles both cases:
+The `search_content()` method handles all cases: uncompressed and compressed inline blobs, plus chunked objects. This is the recommended approach:
 
 ```python
 from dulwich_sqlite import SqliteRepo
@@ -243,6 +182,14 @@ for sha in matches:
     print(sha)
 repo.close()
 ```
+
+`search_content()` searches in four phases:
+1. SQL `LIKE` on uncompressed inline blobs (fast, done in SQLite)
+2. Python-side search on compressed inline blobs (requires decompression)
+3. SQL `LIKE` on uncompressed chunks + Python-side search on compressed chunks
+4. Scan chunked objects' `chunk_refs` blobs for matching chunk rowids
+
+**Note:** Since schema v9, chunk-to-object mappings are stored as packed binary in `chunk_refs`. Direct SQL queries for chunk content search across objects are no longer practical — use `search_content()` instead.
 
 ## Ref Queries
 
@@ -346,7 +293,6 @@ SELECT
     (SELECT COUNT(*) FROM objects WHERE NOT is_chunked) as inline_objects,
     (SELECT COUNT(*) FROM objects WHERE is_chunked) as chunked_objects,
     (SELECT COUNT(*) FROM chunks) as unique_chunks,
-    (SELECT COUNT(*) FROM object_chunks) as chunk_references,
     (SELECT COUNT(*) FROM refs) as refs,
     (SELECT COUNT(*) FROM reflog) as reflog_entries;
 ```
