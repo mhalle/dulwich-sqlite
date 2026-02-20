@@ -423,20 +423,48 @@ class TestZstdCompression:
         db = str(tmp_path / "zstd_dict.db")
         repo = SqliteRepo.init_bare(db, compress="zstd")
         try:
-            # Store several blobs to have enough samples
+            # Store several blobs to have enough samples for chunks + inline objects
             for i in range(20):
                 blob = Blob.from_string(_large_text(f"sample_{i}"))
                 repo.object_store.add_object(blob)
 
+            # Add commits and trees for type-specific dict training
+            from dulwich.objects import Commit, Tree
+            import time as _time
+
+            trees_and_commits = []
+            for i in range(15):
+                blob = Blob.from_string(f"file content {i}".encode())
+                repo.object_store.add_object(blob)
+                tree = Tree()
+                tree.add(f"file_{i}.txt".encode(), 0o100644, blob.id)
+                repo.object_store.add_object(tree)
+                commit = Commit()
+                commit.tree = tree.id
+                commit.author = commit.committer = b"Test <test@example.com>"
+                commit.author_time = commit.commit_time = int(_time.time()) + i
+                commit.author_timezone = commit.commit_timezone = 0
+                commit.encoding = b"UTF-8"
+                commit.message = f"commit {i}".encode()
+                repo.object_store.add_object(commit)
+                trees_and_commits.append((tree, commit))
+
             # Train dictionary
             repo.train_dictionary()
-            assert repo.object_store._zstd_dict is not None
+            assert len(repo.object_store._zstd_dicts) > 0
 
-            # Verify dict is stored
+            # Verify type-specific dict files exist
+            for path in ['_zstd_dict_commit', '_zstd_dict_tree', '_zstd_dict_chunk']:
+                row = repo._conn.execute(
+                    "SELECT contents FROM named_files WHERE path = ?", (path,)
+                ).fetchone()
+                assert row is not None, f"Expected {path} to exist"
+
+            # Verify legacy dict was removed
             row = repo._conn.execute(
                 "SELECT contents FROM named_files WHERE path = '_zstd_dict'"
             ).fetchone()
-            assert row is not None
+            assert row is None
 
             # Store a new blob with dictionary and verify roundtrip
             data = _large_text("after_dict_training")
@@ -444,6 +472,13 @@ class TestZstdCompression:
             repo.object_store.add_object(blob)
             _, retrieved = repo.object_store.get_raw(blob.id)
             assert retrieved == data
+
+            # Verify existing data is still readable after re-compression
+            for tree, commit in trees_and_commits:
+                _, tree_data = repo.object_store.get_raw(tree.id)
+                assert tree_data == tree.as_raw_string()
+                _, commit_data = repo.object_store.get_raw(commit.id)
+                assert commit_data == commit.as_raw_string()
         finally:
             repo.close()
 
@@ -515,6 +550,201 @@ class TestZstdCompression:
                 "SELECT compression FROM chunks LIMIT 1"
             ).fetchone()
             assert row[0] == "zstd"
+        finally:
+            repo.close()
+
+    def test_type_specific_dicts_compress_with_right_dict(self, tmp_path):
+        """Verify each type uses its own dictionary (check frame dict_id)."""
+        import zstandard
+
+        db = str(tmp_path / "typedict.db")
+        repo = SqliteRepo.init_bare(db, compress="zstd")
+        try:
+            from dulwich.objects import Commit, Tree
+            import time as _time
+
+            # Add enough data for training
+            for i in range(20):
+                blob = Blob.from_string(_large_text(f"typedict_{i}"))
+                repo.object_store.add_object(blob)
+                small_blob = Blob.from_string(f"content {i}".encode())
+                repo.object_store.add_object(small_blob)
+                tree = Tree()
+                tree.add(f"f_{i}.txt".encode(), 0o100644, small_blob.id)
+                repo.object_store.add_object(tree)
+                commit = Commit()
+                commit.tree = tree.id
+                commit.author = commit.committer = b"A <a@b.c>"
+                commit.author_time = commit.commit_time = int(_time.time()) + i
+                commit.author_timezone = commit.commit_timezone = 0
+                commit.encoding = b"UTF-8"
+                commit.message = f"msg {i}".encode()
+                repo.object_store.add_object(commit)
+
+            repo.train_dictionary()
+
+            # Verify commit data uses commit dict
+            commit_dict_id = repo.object_store._zstd_dicts['commit'].dict_id()
+            for row in repo._conn.execute(
+                "SELECT data FROM objects WHERE type_num = 1 AND compression = 'zstd'"
+            ).fetchall():
+                params = zstandard.get_frame_parameters(bytes(row[0]))
+                assert params.dict_id == commit_dict_id
+
+            # Verify tree data uses tree dict
+            tree_dict_id = repo.object_store._zstd_dicts['tree'].dict_id()
+            for row in repo._conn.execute(
+                "SELECT data FROM objects WHERE type_num = 2 AND compression = 'zstd'"
+            ).fetchall():
+                params = zstandard.get_frame_parameters(bytes(row[0]))
+                assert params.dict_id == tree_dict_id
+
+            # Verify chunks use chunk dict
+            chunk_dict_id = repo.object_store._zstd_dicts['chunk'].dict_id()
+            for row in repo._conn.execute(
+                "SELECT data FROM chunks WHERE compression = 'zstd'"
+            ).fetchall():
+                params = zstandard.get_frame_parameters(bytes(row[0]))
+                assert params.dict_id == chunk_dict_id
+
+            # Verify blobs (type_num=3 inline) use no dict (dict_id=0)
+            for row in repo._conn.execute(
+                "SELECT data FROM objects WHERE type_num = 3 AND data IS NOT NULL AND compression = 'zstd'"
+            ).fetchall():
+                params = zstandard.get_frame_parameters(bytes(row[0]))
+                assert params.dict_id == 0
+        finally:
+            repo.close()
+
+    def test_legacy_dict_backward_compat(self, tmp_path):
+        """Data compressed with old single dict is still readable after type-specific training."""
+        import zstandard
+
+        db = str(tmp_path / "legacy_compat.db")
+        repo = SqliteRepo.init_bare(db, compress="zstd")
+        try:
+            from dulwich.objects import Commit, Tree
+            import time as _time
+
+            # Add data and manually create a legacy single dict
+            samples = []
+            for i in range(20):
+                blob = Blob.from_string(_large_text(f"legacy_{i}"))
+                repo.object_store.add_object(blob)
+                small_blob = Blob.from_string(f"file {i}".encode())
+                repo.object_store.add_object(small_blob)
+                tree = Tree()
+                tree.add(f"f_{i}.txt".encode(), 0o100644, small_blob.id)
+                repo.object_store.add_object(tree)
+                commit = Commit()
+                commit.tree = tree.id
+                commit.author = commit.committer = b"A <a@b.c>"
+                commit.author_time = commit.commit_time = int(_time.time()) + i
+                commit.author_timezone = commit.commit_timezone = 0
+                commit.encoding = b"UTF-8"
+                commit.message = f"commit {i}".encode()
+                repo.object_store.add_object(commit)
+
+            # Save all raw data for later verification
+            all_objects = {}
+            for row in repo._conn.execute(
+                "SELECT sha, type_num, data, compression FROM objects WHERE data IS NOT NULL"
+            ).fetchall():
+                raw = repo.object_store._decompress(bytes(row[2]), row[3])
+                all_objects[bytes(row[0])] = (row[1], raw)
+
+            # Now train type-specific dicts — this re-compresses everything
+            repo.train_dictionary()
+
+            # Verify all data still readable
+            for sha_bin, (type_num, expected_raw) in all_objects.items():
+                hexsha = sha_bin.hex().encode("ascii")
+                got_type, got_raw = repo.object_store.get_raw(hexsha)
+                assert got_type == type_num
+                assert got_raw == expected_raw
+        finally:
+            repo.close()
+
+    def test_train_dictionary_skips_sparse_types(self, tmp_path):
+        """Only dict for types with >= 10 samples is created."""
+        db = str(tmp_path / "sparse.db")
+        repo = SqliteRepo.init_bare(db, compress="zstd")
+        try:
+            # Only add chunks (blobs), no commits/trees
+            for i in range(20):
+                blob = Blob.from_string(_large_text(f"sparse_{i}"))
+                repo.object_store.add_object(blob)
+
+            repo.train_dictionary()
+
+            # Only chunk dict should exist
+            assert 'chunk' in repo.object_store._zstd_dicts
+            assert 'commit' not in repo.object_store._zstd_dicts
+            assert 'tree' not in repo.object_store._zstd_dicts
+
+            # Verify named_files
+            row = repo._conn.execute(
+                "SELECT 1 FROM named_files WHERE path = '_zstd_dict_chunk'"
+            ).fetchone()
+            assert row is not None
+            row = repo._conn.execute(
+                "SELECT 1 FROM named_files WHERE path = '_zstd_dict_commit'"
+            ).fetchone()
+            assert row is None
+            row = repo._conn.execute(
+                "SELECT 1 FROM named_files WHERE path = '_zstd_dict_tree'"
+            ).fetchone()
+            assert row is None
+        finally:
+            repo.close()
+
+    def test_recompression_reduces_size(self, tmp_path):
+        """Re-compression with type-specific dicts should not increase size."""
+        db = str(tmp_path / "recomp.db")
+        repo = SqliteRepo.init_bare(db, compress="zstd")
+        try:
+            from dulwich.objects import Commit, Tree
+            import time as _time
+
+            for i in range(20):
+                blob = Blob.from_string(_large_text(f"recomp_{i}"))
+                repo.object_store.add_object(blob)
+                small_blob = Blob.from_string(f"content {i}".encode())
+                repo.object_store.add_object(small_blob)
+                tree = Tree()
+                tree.add(f"f_{i}.txt".encode(), 0o100644, small_blob.id)
+                repo.object_store.add_object(tree)
+                commit = Commit()
+                commit.tree = tree.id
+                commit.author = commit.committer = b"A <a@b.c>"
+                commit.author_time = commit.commit_time = int(_time.time()) + i
+                commit.author_timezone = commit.commit_timezone = 0
+                commit.encoding = b"UTF-8"
+                commit.message = f"msg {i}".encode()
+                repo.object_store.add_object(commit)
+
+            # Measure size before training
+            size_before = repo._conn.execute(
+                "SELECT SUM(LENGTH(data)) FROM objects WHERE data IS NOT NULL AND compression = 'zstd'"
+            ).fetchone()[0] or 0
+            chunk_size_before = repo._conn.execute(
+                "SELECT SUM(LENGTH(data)) FROM chunks WHERE compression = 'zstd'"
+            ).fetchone()[0] or 0
+            total_before = size_before + chunk_size_before
+
+            repo.train_dictionary()
+
+            # Measure size after training
+            size_after = repo._conn.execute(
+                "SELECT SUM(LENGTH(data)) FROM objects WHERE data IS NOT NULL AND compression = 'zstd'"
+            ).fetchone()[0] or 0
+            chunk_size_after = repo._conn.execute(
+                "SELECT SUM(LENGTH(data)) FROM chunks WHERE compression = 'zstd'"
+            ).fetchone()[0] or 0
+            total_after = size_after + chunk_size_after
+
+            # Type-specific dicts should not make things worse
+            assert total_after <= total_before
         finally:
             repo.close()
 

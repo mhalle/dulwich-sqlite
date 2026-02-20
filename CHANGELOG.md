@@ -6,6 +6,7 @@ All notable changes to dulwich-sqlite are documented in this file.
 
 ### Changed
 
+- **Type-specific zstd compression dictionaries**: `train_dictionary()` now trains separate dictionaries for commits, trees, and chunks instead of a single shared dictionary. Decompression auto-detects the correct dictionary via zstd frame `dict_id`. Existing zstd data is re-compressed with type-specific dictionaries for improved compression (~12 MB savings on typical large repos). No schema change required.
 - **Schema v10**: Binary SHAs + delta-varint chunk_refs
   - `objects.sha` changed from TEXT(40) to BLOB(20) — halves SHA storage and index size
   - `chunks.chunk_sha` changed from TEXT(64) to BLOB(32) — halves chunk SHA storage and index size

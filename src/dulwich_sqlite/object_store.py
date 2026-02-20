@@ -20,6 +20,7 @@ from ._chunking import chunk_blob
 
 PACK_SPOOL_FILE_MAX_SIZE = 200 * 1024 * 1024
 _BLOB_TYPE_NUM = 3
+_TYPE_TO_DICT_KEY = {1: 'commit', 2: 'tree'}
 
 
 def _encode_unsigned_varint(value: int) -> bytes:
@@ -86,14 +87,20 @@ class SqliteObjectStore(PackCapableObjectStore):
             "SELECT value FROM metadata WHERE key = 'compression'"
         ).fetchone()
         self._compression: str = row[0] if row is not None else "none"
-        self._zstd_dict = None
-        dict_row = conn.execute(
-            "SELECT contents FROM named_files WHERE path = '_zstd_dict'"
-        ).fetchone()
-        if dict_row is not None:
-            import zstandard
+        self._zstd_dicts: dict[str, "zstandard.ZstdCompressionDict"] = {}
+        self._zstd_dicts_by_id: dict[int, "zstandard.ZstdCompressionDict"] = {}
+        for key, path in [('commit', '_zstd_dict_commit'), ('tree', '_zstd_dict_tree'),
+                          ('chunk', '_zstd_dict_chunk'), ('legacy', '_zstd_dict')]:
+            dict_row = conn.execute(
+                "SELECT contents FROM named_files WHERE path = ?", (path,)
+            ).fetchone()
+            if dict_row is not None:
+                import zstandard
 
-            self._zstd_dict = zstandard.ZstdCompressionDict(bytes(dict_row[0]))
+                d = zstandard.ZstdCompressionDict(bytes(dict_row[0]))
+                d.precompute_compress(level=3)
+                self._zstd_dicts[key] = d
+                self._zstd_dicts_by_id[d.dict_id()] = d
 
     def _to_hexsha(self, sha: ObjectID | RawObjectID) -> ObjectID:
         if len(sha) == self.object_format.hex_length:
@@ -110,7 +117,7 @@ class SqliteObjectStore(PackCapableObjectStore):
         hexsha = self._to_hexsha(sha)
         return bytes.fromhex(hexsha.decode("ascii"))
 
-    def _compress(self, data: bytes) -> bytes:
+    def _compress(self, data: bytes, dict_key: str | None = None) -> bytes:
         if self._compression == "none":
             return data
         if self._compression == "zlib":
@@ -119,8 +126,9 @@ class SqliteObjectStore(PackCapableObjectStore):
             import zstandard
 
             kwargs = {}
-            if self._zstd_dict is not None:
-                kwargs["dict_data"] = self._zstd_dict
+            zdict = self._zstd_dicts.get(dict_key) if dict_key else None
+            if zdict is not None:
+                kwargs["dict_data"] = zdict
             cctx = zstandard.ZstdCompressor(level=3, **kwargs)
             return cctx.compress(data)
         raise ValueError(f"Unknown compression method: {self._compression}")
@@ -133,10 +141,12 @@ class SqliteObjectStore(PackCapableObjectStore):
         if method == "zstd":
             import zstandard
 
-            kwargs = {}
-            if self._zstd_dict is not None:
-                kwargs["dict_data"] = self._zstd_dict
-            dctx = zstandard.ZstdDecompressor(**kwargs)
+            params = zstandard.get_frame_parameters(data)
+            dict_data = self._zstd_dicts_by_id.get(params.dict_id)
+            if dict_data is not None:
+                dctx = zstandard.ZstdDecompressor(dict_data=dict_data)
+            else:
+                dctx = zstandard.ZstdDecompressor()
             return dctx.decompress(data)
         raise ValueError(f"Unknown compression method: {method}")
 
@@ -205,7 +215,7 @@ class SqliteObjectStore(PackCapableObjectStore):
         if chunks is not None:
             chunk_rowids = []
             for chunk_sha_bin, chunk_data in chunks:
-                stored_data = self._compress(chunk_data)
+                stored_data = self._compress(chunk_data, dict_key='chunk')
                 self._conn.execute(
                     "INSERT OR IGNORE INTO chunks (chunk_sha, data, compression) "
                     "VALUES (?, ?, ?)",
@@ -224,7 +234,7 @@ class SqliteObjectStore(PackCapableObjectStore):
             )
         else:
             # Inline storage
-            stored_data = self._compress(raw_data)
+            stored_data = self._compress(raw_data, dict_key=_TYPE_TO_DICT_KEY.get(obj.type_num))
             self._conn.execute(
                 "INSERT OR REPLACE INTO objects (sha, type_num, data, chunk_refs, total_size, compression) "
                 "VALUES (?, ?, ?, NULL, ?, ?)",

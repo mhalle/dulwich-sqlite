@@ -164,7 +164,27 @@ The `compression` column in the `chunks` table records the method used for each 
 
 zstd (Zstandard) is the default compression method when `compress=True`. It offers better compression ratios and faster speed than zlib.
 
-**Dictionary training**: zstd supports trained dictionaries that improve compression for small, similar data. The `train_dictionary()` method samples existing chunks and inline objects, trains a 32 KB dictionary, and stores it in `named_files` at path `_zstd_dict`. The dictionary is loaded automatically when opening a repository. `clone_from()` trains a dictionary automatically after fetching when using zstd.
+**Type-specific dictionary training**: Different Git object types have distinct internal structures, so `train_dictionary()` trains separate dictionaries for each type:
+
+| Named file key | Dict name | Used for |
+|---|---|---|
+| `_zstd_dict_commit` | `commit` | Inline objects with type_num=1 |
+| `_zstd_dict_tree` | `tree` | Inline objects with type_num=2 |
+| `_zstd_dict_chunk` | `chunk` | All chunk data |
+| `_zstd_dict` (legacy) | `legacy` | Backward compat: data compressed with old single dict |
+
+Inline blobs (type_num=3) and tags (type_num=4) are compressed without a dictionary — they are too small or rare for a dictionary to help.
+
+**Decompression (dict_id-based lookup)**: zstd frames contain a `dict_id` header field identifying which dictionary was used (0 = no dict). On decompression, the frame header is read to determine the correct dictionary automatically:
+
+```python
+params = zstandard.get_frame_parameters(data)
+dict_data = self._zstd_dicts_by_id.get(params.dict_id)
+```
+
+This handles all cases — type-specific dicts, legacy single dict, and no-dict frames — without try/except.
+
+**Re-compression**: When `train_dictionary()` trains new dictionaries, it re-compresses all existing zstd data with the appropriate type-specific dictionary and removes the legacy single dictionary if present. The dictionaries are loaded automatically when opening a repository. `clone_from()` trains dictionaries automatically after fetching when using zstd.
 
 ### On Read
 

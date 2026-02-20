@@ -128,11 +128,11 @@ Toggle compression for future chunk writes. Supported methods: `"zlib"` and `"zs
 repo.train_dictionary(dict_size: int = 32768) -> None
 ```
 
-Trains a zstd compression dictionary from existing chunk and inline object data. Stores the dictionary in `named_files` and loads it into the object store for immediate use. Called automatically by `clone_from()` when using zstd compression. Can also be called manually after adding data to improve compression ratios.
+Trains three type-specific zstd compression dictionaries (commit, tree, chunk) from existing data. Each dictionary is optimized for its data type's internal structure. After training, re-compresses all existing zstd data with the appropriate type-specific dictionary and removes any legacy single dictionary. Stores dictionaries in `named_files` and loads them into the object store for immediate use. Called automatically by `clone_from()` when using zstd compression. Types with fewer than 10 samples are skipped.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `dict_size` | `int` | `32768` | Size of the trained dictionary in bytes |
+| `dict_size` | `int` | `32768` | Size of each trained dictionary in bytes |
 
 #### `read_reflog`
 

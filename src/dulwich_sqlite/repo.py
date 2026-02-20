@@ -372,33 +372,94 @@ class SqliteRepo(BaseRepo):
         porcelain.push(self, remote_location, **kwargs)
 
     def train_dictionary(self, dict_size: int = 32768) -> None:
-        """Train a zstd compression dictionary from existing chunk data.
+        """Train type-specific zstd compression dictionaries.
 
-        Stores the trained dictionary in named_files at path ``_zstd_dict``
-        and loads it into the object store for immediate use.
+        Trains separate dictionaries for commits, trees, and chunks, then
+        re-compresses all existing zstd data with the appropriate dictionary.
+        Stores dictionaries in named_files (``_zstd_dict_commit``,
+        ``_zstd_dict_tree``, ``_zstd_dict_chunk``) and loads them into the
+        object store for immediate use.
 
         Args:
-            dict_size: Size of the trained dictionary in bytes (default 32 KB).
+            dict_size: Size of each trained dictionary in bytes (default 32 KB).
         """
         import zstandard
 
-        samples = []
+        from .object_store import _TYPE_TO_DICT_KEY
+
+        # 1. Sample by type
+        commit_samples: list[bytes] = []
+        tree_samples: list[bytes] = []
+        for row in self._conn.execute(
+            "SELECT type_num, data, compression FROM objects "
+            "WHERE data IS NOT NULL LIMIT 15000"
+        ):
+            raw = self.object_store._decompress(bytes(row[1]), row[2])
+            if row[0] == 1:
+                commit_samples.append(raw)
+            elif row[0] == 2:
+                tree_samples.append(raw)
+
+        chunk_samples: list[bytes] = []
         for row in self._conn.execute(
             "SELECT data, compression FROM chunks LIMIT 10000"
         ):
-            raw = self.object_store._decompress(bytes(row[0]), row[1])
-            samples.append(raw)
-        for row in self._conn.execute(
-            "SELECT data, compression FROM objects WHERE data IS NOT NULL LIMIT 5000"
-        ):
-            samples.append(self.object_store._decompress(bytes(row[0]), row[1]))
-        if len(samples) < 10:
-            return
-        dict_data = zstandard.train_dictionary(dict_size, samples)
-        self._put_named_file("_zstd_dict", dict_data.as_bytes())
-        self.object_store._zstd_dict = zstandard.ZstdCompressionDict(
-            dict_data.as_bytes()
-        )
+            chunk_samples.append(self.object_store._decompress(bytes(row[0]), row[1]))
+
+        # 2. Train type-specific dicts (min 10 samples each)
+        new_dicts: dict[str, zstandard.ZstdCompressionDict] = {}
+        for key, samples in [('commit', commit_samples), ('tree', tree_samples),
+                              ('chunk', chunk_samples)]:
+            if len(samples) >= 10:
+                d = zstandard.train_dictionary(dict_size, samples)
+                new_dicts[key] = d
+
+        if not new_dicts:
+            return  # not enough data
+
+        # 3. Store new dicts
+        named_file_keys = {'commit': '_zstd_dict_commit', 'tree': '_zstd_dict_tree',
+                           'chunk': '_zstd_dict_chunk'}
+        for key, d in new_dicts.items():
+            self._put_named_file(named_file_keys[key], d.as_bytes())
+
+        # 4. Load into object store (keep old dicts in by_id map for decompression during re-compress)
+        for key, d in new_dicts.items():
+            zdict = zstandard.ZstdCompressionDict(d.as_bytes())
+            zdict.precompute_compress(level=3)
+            self.object_store._zstd_dicts[key] = zdict
+            self.object_store._zstd_dicts_by_id[zdict.dict_id()] = zdict
+
+        # 5. Re-compress all zstd data with type-specific dicts
+        with self._conn:
+            # Inline objects
+            for row in self._conn.execute(
+                "SELECT sha, type_num, data, compression FROM objects "
+                "WHERE data IS NOT NULL AND compression = 'zstd'"
+            ).fetchall():
+                sha, type_num, old_data, comp = row
+                raw = self.object_store._decompress(bytes(old_data), comp)
+                dict_key = _TYPE_TO_DICT_KEY.get(type_num)
+                new_data = self.object_store._compress(raw, dict_key=dict_key)
+                self._conn.execute("UPDATE objects SET data = ? WHERE sha = ?",
+                                   (new_data, bytes(sha)))
+            # Chunks
+            for row in self._conn.execute(
+                "SELECT rowid, data, compression FROM chunks WHERE compression = 'zstd'"
+            ).fetchall():
+                rowid, old_data, comp = row
+                raw = self.object_store._decompress(bytes(old_data), comp)
+                new_data = self.object_store._compress(raw, dict_key='chunk')
+                self._conn.execute("UPDATE chunks SET data = ? WHERE rowid = ?",
+                                   (new_data, rowid))
+
+        # 6. Remove legacy single dict
+        self._conn.execute("DELETE FROM named_files WHERE path = '_zstd_dict'")
+        self._conn.commit()
+        self.object_store._zstd_dicts.pop('legacy', None)
+
+        # 7. Reclaim freed pages from re-compression
+        self._conn.execute("VACUUM")
 
     def close(self) -> None:
         self.object_store.close()
