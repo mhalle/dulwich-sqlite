@@ -14,14 +14,6 @@ from ._schema import (
     SCHEMA_VERSION,
     apply_pragmas,
     init_db,
-    migrate_v3_to_v4,
-    migrate_v4_to_v5,
-    migrate_v5_to_v6,
-    migrate_v6_to_v7,
-    migrate_v7_to_v8,
-    migrate_v8_to_v9,
-    migrate_v9_to_v10,
-    migrate_v10_to_v11,
 )
 from .object_store import SqliteObjectStore
 from .refs import SqliteRefsContainer
@@ -57,7 +49,6 @@ class SqliteRepo(BaseRepo):
     def _verify_schema(self) -> None:
         """Check that the database has been initialized with our schema.
 
-        Automatically migrates v3 and v4 databases to the current version.
         Raises NotGitRepository for missing/invalid schemas or unsupported versions.
         """
         try:
@@ -73,30 +64,6 @@ class SqliteRepo(BaseRepo):
                 f"Not a dulwich-sqlite repository: {self._db_path}"
             )
         version = row[0]
-        if version == "3":
-            migrate_v3_to_v4(self._conn)
-            version = "4"
-        if version == "4":
-            migrate_v4_to_v5(self._conn)
-            version = "5"
-        if version == "5":
-            migrate_v5_to_v6(self._conn)
-            version = "6"
-        if version == "6":
-            migrate_v6_to_v7(self._conn)
-            version = "7"
-        if version == "7":
-            migrate_v7_to_v8(self._conn)
-            version = "8"
-        if version == "8":
-            migrate_v8_to_v9(self._conn)
-            version = "9"
-        if version == "9":
-            migrate_v9_to_v10(self._conn)
-            version = "10"
-        if version == "10":
-            migrate_v10_to_v11(self._conn)
-            version = "11"
         if version != SCHEMA_VERSION:
             raise NotGitRepository(
                 f"Unsupported schema version {version} "
