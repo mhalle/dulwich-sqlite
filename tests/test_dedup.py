@@ -178,3 +178,58 @@ class TestSearchContent:
 
         results = store.search_content("nonexistent")
         assert results == []
+
+    def test_search_like_wildcards_treated_as_literal(self, store):
+        """% and _ in query are treated as literal characters, not wildcards."""
+        blob_with_percent = Blob.from_string(b"100% done")
+        blob_with_underscore = Blob.from_string(b"key_value pair")
+        blob_no_match = Blob.from_string(b"no special chars here")
+        store.add_object(blob_with_percent)
+        store.add_object(blob_with_underscore)
+        store.add_object(blob_no_match)
+
+        # "%" should only match the blob containing a literal %
+        results = store.search_content("%")
+        assert blob_with_percent.id in results
+        assert blob_no_match.id not in results
+
+        # "_" should only match the blob containing a literal _
+        results = store.search_content("_")
+        assert blob_with_underscore.id in results
+        assert blob_no_match.id not in results
+
+    def test_search_boundary_spanning_match(self, store):
+        """Query that spans a chunk boundary is found."""
+        # Build data where "NEEDLE" spans the boundary between chunks.
+        # Use enough data to guarantee chunking, then place NEEDLE so that
+        # it straddles the split point.
+        prefix = _large_text("padding", n=300)
+        suffix = _large_text("filler", n=300)
+        # Insert NEEDLE right at the join so it likely spans a chunk boundary
+        data = prefix + b"NEEDLE" + suffix
+        blob = Blob.from_string(data)
+        store.add_object(blob)
+
+        # Verify it was chunked
+        sha_bin = bytes.fromhex(blob.id.decode("ascii"))
+        row = store._conn.execute(
+            "SELECT chunk_refs FROM objects WHERE sha = ?", (sha_bin,)
+        ).fetchone()
+        assert row[0] is not None, "Expected blob to be chunked"
+
+        # NEEDLE should be found even if it spans chunks
+        results = store.search_content("NEEDLE")
+        assert blob.id in results
+
+    def test_search_limit_deterministic(self, store):
+        """Results with limit are deterministic (sorted)."""
+        blobs = []
+        for i in range(10):
+            b = Blob.from_string(_large_text(f"deterministic{i} shared_term"))
+            store.add_object(b)
+            blobs.append(b)
+
+        results1 = store.search_content("shared_term", limit=5)
+        results2 = store.search_content("shared_term", limit=5)
+        assert len(results1) == 5
+        assert results1 == results2

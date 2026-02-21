@@ -415,13 +415,18 @@ class SqliteObjectStore(PackCapableObjectStore):
         else:
             commit()
 
+    @staticmethod
+    def _escape_like(s: str) -> str:
+        """Escape ``%``, ``_``, and ``\\`` for use in a LIKE pattern."""
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     def search_content(
         self,
         query: str,
         *,
         limit: int | None = None,
     ) -> list[ObjectID]:
-        """Search blob content for matching objects via substring match.
+        """Search blob content for matching objects via literal substring match.
 
         Args:
             query: Substring to search for in blob content.
@@ -429,13 +434,14 @@ class SqliteObjectStore(PackCapableObjectStore):
         """
         results: set[bytes] = set()
         query_bytes = query.encode("utf-8", errors="surrogateescape")
+        escaped = self._escape_like(query)
 
-        # 1. SQL LIKE on uncompressed inline blobs
+        # 1. SQL LIKE on uncompressed inline blobs (escape LIKE wildcards)
         for row in self._conn.execute(
             "SELECT sha FROM objects "
             "WHERE data IS NOT NULL AND type_num = 3 AND compression = 'none' "
-            "AND CAST(data AS TEXT) LIKE ?",
-            (f"%{query}%",),
+            "AND CAST(data AS TEXT) LIKE ? ESCAPE '\\'",
+            (f"%{escaped}%",),
         ).fetchall():
             results.add(bytes(row[0]))
 
@@ -449,34 +455,55 @@ class SqliteObjectStore(PackCapableObjectStore):
                 if query_bytes in self._decompress(bytes(row[1]), row[2]):
                     results.add(sha_bin)
 
-        # 3. Find matching chunk rowids (uncompressed via SQL, compressed via Python)
-        matching_chunk_rowids: set[int] = set()
+        # 3. Find candidate chunk rowids (uncompressed via SQL, compressed via Python)
+        candidate_chunk_rowids: set[int] = set()
         for row in self._conn.execute(
             "SELECT rowid FROM chunks "
-            "WHERE compression = 'none' AND CAST(data AS TEXT) LIKE ?",
-            (f"%{query}%",),
+            "WHERE compression = 'none' AND CAST(data AS TEXT) LIKE ? ESCAPE '\\'",
+            (f"%{escaped}%",),
         ).fetchall():
-            matching_chunk_rowids.add(row[0])
+            candidate_chunk_rowids.add(row[0])
 
         for row in self._conn.execute(
             "SELECT rowid, data, compression FROM chunks WHERE compression != 'none'"
         ).fetchall():
             if query_bytes in self._decompress(bytes(row[1]), row[2]):
-                matching_chunk_rowids.add(row[0])
+                candidate_chunk_rowids.add(row[0])
 
-        # 4. Scan chunked objects' chunk_refs blobs for matching rowids
-        if matching_chunk_rowids:
-            for row in self._conn.execute(
-                "SELECT sha, chunk_refs FROM objects "
-                "WHERE chunk_refs IS NOT NULL AND type_num = 3"
-            ).fetchall():
-                sha_bin = bytes(row[0])
-                if sha_bin not in results:
-                    rowids = set(unpack_chunk_refs(bytes(row[1])))
-                    if rowids & matching_chunk_rowids:
-                        results.add(sha_bin)
+        # 4. Scan chunked objects: check single-chunk matches and boundary spans
+        for row in self._conn.execute(
+            "SELECT sha, chunk_refs FROM objects "
+            "WHERE chunk_refs IS NOT NULL AND type_num = 3"
+        ).fetchall():
+            sha_bin = bytes(row[0])
+            if sha_bin in results:
+                continue
+            rowids = unpack_chunk_refs(bytes(row[1]))
+            # Fast path: any single chunk contains the query
+            if set(rowids) & candidate_chunk_rowids:
+                results.add(sha_bin)
+                continue
+            # Slow path: check chunk boundaries for spans
+            if len(query_bytes) > 1 and len(rowids) > 1:
+                overlap = len(query_bytes) - 1
+                prev_tail = b""
+                found = False
+                for rid in rowids:
+                    chunk_row = self._conn.execute(
+                        "SELECT data, compression FROM chunks WHERE rowid = ?",
+                        (rid,),
+                    ).fetchone()
+                    chunk_data = self._decompress(bytes(chunk_row[0]), chunk_row[1])
+                    if prev_tail:
+                        window = prev_tail + chunk_data[:overlap]
+                        if query_bytes in window:
+                            found = True
+                            break
+                    prev_tail = chunk_data[-overlap:] if len(chunk_data) >= overlap else chunk_data
+                if found:
+                    results.add(sha_bin)
 
-        out = list(results)
+        out = sorted(results)
         if limit is not None:
             out = out[: int(limit)]
         return [r.hex().encode("ascii") for r in out]

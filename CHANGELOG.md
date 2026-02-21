@@ -2,6 +2,14 @@
 
 All notable changes to dulwich-sqlite are documented in this file.
 
+## [0.6.1] — 2026-02-20
+
+### Fixed
+
+- **search_content() LIKE injection**: `%` and `_` in queries are now treated as literal characters, not SQL wildcards
+- **search_content() cross-boundary misses**: queries spanning chunk boundaries are now found via boundary-window scanning
+- **search_content() nondeterministic limit**: results are now sorted by SHA for stable ordering when `limit` is used
+
 ## [0.6.0] — 2026-02-20
 
 First public release. Stores a full bare Git repository in a single SQLite file.
